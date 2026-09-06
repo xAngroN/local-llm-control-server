@@ -10,7 +10,7 @@ model server):
 * Token throughput and the loaded model, read from the llama.cpp model
   server (``/props`` and ``/metrics``). Throughput is *not* computed
   here: llama.cpp already publishes per-second counters in its
-  Prometheus output, so the parser only extracts those values.
+  Prometheus output, so the parser only reads those published values.
 
 Neither source is ever asked to fail the other: every read degrades to
 ``None`` values instead of raising, so ``GET /metrics`` on the control
@@ -56,20 +56,22 @@ def _parse_prometheus(text: str) -> dict[str, float]:
     return result
 
 
-def _rate(samples: dict[str, float], count_name: str, time_name: str) -> float | None:
-    """Compute ``count / time`` from parsed samples, ``None`` when missing.
+def _throughput(samples: dict[str, float], name: str) -> float | None:
+    """Read an already-published tokens/second counter, ``None`` when absent.
 
-    llama.cpp metric names vary between versions; anything that is
-    absent or malformed (including a zero denominator) degrades to
-    ``None`` instead of raising, keeping the no-exception contract.
+    llama.cpp emits per-second throughput counters in its Prometheus
+    output; this helper only reads the published value and never derives
+    a rate from raw counters or timestamps. Missing names or values that
+    do not parse degrade to ``None`` instead of raising, keeping the
+    no-exception contract.
     """
-    count = samples.get(count_name)
-    time = samples.get(time_name)
-    if not isinstance(count, float) or not isinstance(time, float):
+    value = samples.get(name)
+    if isinstance(value, float):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return None
-    if time <= 0:
-        return None
-    return count / time
 
 
 def _read_int_file(path: str) -> int | None:
@@ -129,9 +131,12 @@ class MetricsCollector:
         """Query the model server's ``/props`` and ``/metrics``.
 
         Returns ``{"model", "prompt_tps", "generation_tps"}`` extracted
-        from the answers. Any transport failure (connection refused,
-        timeout, HTTP error) yields ``None`` for every field instead of
-        an exception.
+        from the answers. The throughput values are the tokens/second
+        counters llama.cpp already publishes in its Prometheus output
+        (``llama_prompt_tokens_per_second`` / ``llama_tokens_predicted_per_second``),
+        not a rate computed here. Any transport failure (connection
+        refused, timeout, HTTP error) yields ``None`` for every field
+        instead of an exception.
         """
         model: str | None = None
         prompt_tps: float | None = None
@@ -152,8 +157,12 @@ class MetricsCollector:
             response = httpx.get(self._base_url.rstrip("/") + "/metrics", timeout=_TIMEOUT)
             if response.status_code == 200:
                 samples = _parse_prometheus(response.text)
-                prompt_tps = _rate(samples, "llama_eval_count", "llama_eval_time")
-                generation_tps = _rate(samples, "llama_sample_count", "llama_sample_time")
+                prompt_tps = _throughput(
+                    samples, "llama_prompt_tokens_per_second"
+                )
+                generation_tps = _throughput(
+                    samples, "llama_tokens_predicted_per_second"
+                )
         except (httpx.HTTPError, ValueError):
             pass
 

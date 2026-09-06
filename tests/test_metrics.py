@@ -25,14 +25,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PROFILES_TOML = REPO_ROOT / "config" / "profiles.toml"
 
 PROMETHEUS_SAMPLE = """\
-# HELP llama_eval_time Total time spent processing prompts
-# TYPE llama_eval_time counter
-llama_eval_count 612
-llama_eval_time 12.0
-# HELP llama_sample_time Total time spent sampling tokens
-# TYPE llama_sample_time counter
-llama_sample_count 300
-llama_sample_time 10.0
+# HELP llama_prompt_tokens_per_second Prompt tokens per second
+# TYPE llama_prompt_tokens_per_second counter
+llama_prompt_tokens_per_second 51.0
+# HELP llama_tokens_predicted_per_second Predicted tokens per second
+# TYPE llama_tokens_predicted_per_second counter
+llama_tokens_predicted_per_second 30.0
 some_other_metric 42.5
 bad_line_without_value
 """
@@ -81,10 +79,8 @@ def test_read_vram_missing_files_yield_none(tmp_path) -> None:
 
 def test_parse_prometheus_sample_numbers() -> None:
     samples = _parse_prometheus(PROMETHEUS_SAMPLE)
-    assert samples["llama_eval_count"] == 612.0
-    assert samples["llama_eval_time"] == 12.0
-    assert samples["llama_sample_count"] == 300.0
-    assert samples["llama_sample_time"] == 10.0
+    assert samples["llama_prompt_tokens_per_second"] == 51.0
+    assert samples["llama_tokens_predicted_per_second"] == 30.0
     assert samples["some_other_metric"] == 42.5
     # Comment lines and malformed lines are skipped.
     assert "bad_line_without_value" not in samples
@@ -121,8 +117,10 @@ def test_read_model_metrics_from_local_server(tmp_path) -> None:
     finally:
         server.shutdown()
     assert metrics["model"] == "/models/qwen2.5-7b-instruct.gguf"
-    assert metrics["prompt_tps"] == 51.0  # 612 / 12.0
-    assert metrics["generation_tps"] == 30.0  # 300 / 10.0
+    # Values are the tokens/second counters llama.cpp already publishes;
+    # the collector reads them as-is without computing a rate.
+    assert metrics["prompt_tps"] == 51.0
+    assert metrics["generation_tps"] == 30.0
 
 
 def test_read_model_metrics_unexpected_prometheus_names_yield_none(monkeypatch) -> None:
