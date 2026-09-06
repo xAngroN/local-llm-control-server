@@ -24,6 +24,7 @@ from llamactl.metrics import MetricsCollector
 from llamactl.power import PowerError, suspend
 from llamactl.podman import Podman, PodmanError
 from llamactl.state import InstanceState, InstanceTracker
+from llamactl.suspend_watch import PowerStateWatcher
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,11 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
         manager.handle_container_event,
     )
     poller = HealthPoller(tracker)
+    # The host can suspend on its own (known bug with spontaneous
+    # suspends), so the API also watches the logind PrepareForSleep
+    # signal: on resume the real container state is re-collected via
+    # reconcile before anything is reported again.
+    power_watcher = PowerStateWatcher(tracker, manager.reconcile)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -77,9 +83,11 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             logger.warning("startup reconcile failed: %s", err)
         watcher.start()
         poller.start()
+        power_watcher.start()
         try:
             yield
         finally:
+            power_watcher.stop()
             watcher.stop()
             poller.stop()
 
