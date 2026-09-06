@@ -181,6 +181,10 @@ class EventStream:
             line = proc.stdout.readline()
             if not line:
                 # EOF: the subprocess ended (or was terminated).
+                # Wait for it so the OS reaps the process and the pipe
+                # resources are released -- the same implicit cleanup the
+                # pre-EventStream generator relied on (via GC / close).
+                proc.wait()
                 raise StopIteration
             line = line.strip()
             if not line:
@@ -189,6 +193,15 @@ class EventStream:
                 return json.loads(line)
             except json.JSONDecodeError:
                 continue
+
+    def close(self) -> None:
+        """Close the stream: terminate the subprocess and release resources.
+
+        Safe to call from the consuming thread (e.g. in a ``finally``
+        block) or from another thread.  Idempotent -- calling it after
+        the stream has already exhausted or been terminated is a no-op.
+        """
+        self.terminate()
 
     def terminate(self) -> None:
         """End the underlying subprocess (no-op if not started or done).
