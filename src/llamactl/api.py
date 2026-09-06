@@ -99,6 +99,11 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             raise HTTPException(500, detail=err.stderr) from err
         return tracker.to_dict()
 
+    @app.get("/status")
+    def status() -> dict:
+        """Return the current instance state (read-only, no podman calls)."""
+        return tracker.to_dict()
+
     @app.post("/reload")
     def reload(payload: dict = Body(...)) -> dict:
         """Switch the running instance to another profile."""
