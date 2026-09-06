@@ -203,6 +203,12 @@ class TestLoadConfig:
             assert "--jinja" in args
             assert "-ngl" in args and args[args.index("-ngl") + 1] == "999"
 
+    def test_all_profiles_render_with_metrics_flag(self) -> None:
+        common, profiles = load_config(BUNDLED_PROFILES)
+        for name in ("fast", "large", "safe", "shared"):
+            args = render_server_args(profiles[name], common)
+            assert "--metrics" in args, name
+
     def test_env_var_is_respected(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setenv("LLAMACTL_PROFILES", str(BUNDLED_PROFILES))
         common, profiles = load_config()
