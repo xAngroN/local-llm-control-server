@@ -19,6 +19,7 @@ from llamactl.lifecycle import (
     UnknownProfileError,
 )
 from llamactl.metrics import MetricsCollector
+from llamactl.power import PowerError, suspend
 from llamactl.podman import Podman, PodmanError
 from llamactl.state import InstanceState, InstanceTracker
 
@@ -65,6 +66,7 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
         yield
 
     app = FastAPI(title="llamactl", lifespan=lifespan)
+    app.state.manager = manager
 
     @app.get("/healthz")
     def healthz() -> dict:
@@ -120,6 +122,21 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             else InstanceState(status.state),
             status.profile,
         )
+
+    @app.post("/suspend")
+    def suspend_host() -> dict:
+        """Suspend the host (Suspend-to-RAM) without stopping the instance.
+
+        The container is frozen with the machine, not stopped: no stop
+        or reload logic is invoked and the tracker state is left as-is.
+        """
+        try:
+            suspend()
+        except PowerError as err:
+            raise HTTPException(500, detail=str(err)) from err
+        result = tracker.to_dict()
+        result["suspend_requested"] = True
+        return result
 
     @app.post("/reload")
     def reload(payload: dict = Body(...)) -> dict:
