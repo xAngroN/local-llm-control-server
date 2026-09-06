@@ -469,3 +469,196 @@ def test_reconcile_exited_container_reports_stopped_with_exit_code(fake_podman) 
     assert status.exit_code == 137
     assert status.profile is None
     assert status.container_id is None
+
+
+def test_die_after_stop_reports_stopped_not_crashed(fake_podman) -> None:
+    """A die event arriving after stop() reports stopped, never crashed."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+    mgr.stop()
+    assert mgr._expected_stop is True
+    assert tracker.snapshot().state is InstanceState.STOPPED
+
+    # The event stream delivers the die event for the stopped container.
+    mgr.handle_container_event(
+        {"Type": "container", "Action": "die", "id": "x", "name": common.container_name, "exitCode": 0}
+    )
+
+    snap = tracker.snapshot()
+    assert snap.state is InstanceState.STOPPED
+    assert snap.exit_code is None
+    assert snap.log_tail == []
+    # The flag is consumed, so a later unannounced death is a crash.
+    assert mgr._expected_stop is False
+
+
+def test_stop_event_after_stop_reports_stopped_not_crashed(fake_podman) -> None:
+    """A stop event after stop() also reports stopped and clears the flag."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+    mgr.stop()
+
+    mgr.handle_container_event(
+        {"Type": "container", "Action": "stop", "id": "x", "name": common.container_name}
+    )
+
+    assert tracker.snapshot().state is InstanceState.STOPPED
+    assert mgr._expected_stop is False
+
+
+def test_die_without_prior_stop_reports_crashed_with_exit_code_and_log_tail(fake_podman) -> None:
+    """A die event with no prior stop reports crashed with exit code and log tail."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+    name = common.container_name
+    entry = fake_podman.containers()[name]
+    assert entry["status"] == "running"
+
+    # Simulate an unexpected death (e.g. OOM kill / podman kill).
+    fake_podman.kill(name, exit_code=137)
+
+    mgr.handle_container_event(
+        {"Type": "container", "Action": "die", "id": entry["id"], "name": name, "exitCode": 137}
+    )
+
+    snap = tracker.snapshot()
+    assert snap.state is InstanceState.CRASHED
+    assert snap.exit_code == 137
+    assert snap.log_tail, "log tail must not be empty"
+
+
+def test_die_without_exit_code_field_falls_back_to_podman(fake_podman) -> None:
+    """When the event carries no exitCode, the exit code is read via podman.exit_code()."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("safe")
+    name = common.container_name
+    entry = fake_podman.containers()[name]
+    fake_podman.kill(name, exit_code=99)
+
+    mgr.handle_container_event(
+        {"Type": "container", "Action": "die", "id": event_id(entry), "name": name}
+    )
+
+    snap = tracker.snapshot()
+    assert snap.state is InstanceState.CRASHED
+    assert snap.exit_code == 99
+    assert snap.log_tail
+
+
+def event_id(entry: dict) -> str:
+    return entry["id"]
+
+
+def test_start_after_crash_clears_expected_stop_flag(fake_podman) -> None:
+    """A new start after a crash clears the expected-stop flag (reset semantics)."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+    name = common.container_name
+    entry = fake_podman.containers()[name]
+    fake_podman.kill(name, exit_code=3)
+    mgr.handle_container_event(
+        {"Type": "container", "Action": "die", "id": entry["id"], "name": name, "exitCode": 3}
+    )
+    assert tracker.snapshot().state is InstanceState.CRASHED
+
+    # The next start must reset the expected-stop flag so the new
+    # instance's shutdown is judged afresh.
+    mgr.start("fast")
+    assert mgr._expected_stop is False
+
+
+def test_start_resets_expected_stop_after_stop(fake_podman) -> None:
+    """_start_locked resets the flag set by an earlier stop()."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+    mgr.stop()
+    assert mgr._expected_stop is True
+
+    mgr.start("safe")
+    assert mgr._expected_stop is False
+
+
+def test_die_for_other_container_is_ignored(fake_podman) -> None:
+    """Ending events for other containers are ignored."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+
+    mgr.handle_container_event(
+        {"Type": "container", "Action": "die", "id": "other", "name": "someone-else", "exitCode": 1}
+    )
+
+    # Still the active state, untouched.
+    assert tracker.snapshot().state is InstanceState.LOADING
+    assert mgr._expected_stop is False
+
+
+def test_start_event_is_ignored(fake_podman) -> None:
+    """Start events are ignored by the handler."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.handle_container_event(
+        {"Type": "container", "Action": "start", "id": "x", "name": common.container_name}
+    )
+
+    assert tracker.snapshot().state is InstanceState.STOPPED
+
+
+def test_reload_stop_phase_die_event_reports_stopped(fake_podman) -> None:
+    """A die event arriving during a reload's stop phase reports stopped, not crashed."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+    name = common.container_name
+
+    # Replicate the stop phase of a reload: stop the container and flag
+    # it as self-initiated, then deliver the die event for the old
+    # container before the new one has started.
+    mgr._stop_locked()
+    assert mgr._expected_stop is True
+    old_entry = fake_podman.containers()[name]
+
+    mgr.handle_container_event(
+        {
+            "Type": "container",
+            "Action": "die",
+            "id": old_entry["id"],
+            "name": name,
+            "exitCode": 0,
+        }
+    )
+
+    snap = tracker.snapshot()
+    assert snap.state is InstanceState.STOPPED
+    assert snap.exit_code is None
+    assert mgr._expected_stop is False
+
+    # The reload's start phase then runs cleanly; the flag is still
+    # False and the new container is adopted as loading.
+    status = mgr._start_locked("large")
+    assert status.state is InstanceState.LOADING
+    assert status.profile == "large"

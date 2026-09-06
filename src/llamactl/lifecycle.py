@@ -22,6 +22,13 @@ from .state import InstanceState, InstanceStatus, InstanceTracker
 #: not crashed). Anything else may be started over.
 _INACTIVE_STATES = (InstanceState.STOPPED, InstanceState.CRASHED)
 
+#: Event actions that mean "the container ended" (deliberate or not).
+_ENDING_EVENT_ACTIONS = ("die", "stop")
+
+#: States in which the container is considered gone, so an ending event
+#: must not be re-reported as a crash.
+_GONE_STATES = (InstanceState.STOPPED, InstanceState.SUSPENDED)
+
 
 PROFILE_LABEL = "llamactl.profile"
 
@@ -244,3 +251,61 @@ class LifecycleManager:
                 raise UnknownProfileError(f"unknown profile: {profile_name!r}")
             self._stop_locked()
             return self._start_locked(profile_name)
+
+
+    def handle_container_event(self, event: dict) -> None:
+        """Handle one podman container event from the event watcher.
+
+        This is the callback :class:`~llamactl.events.ContainerEventWatcher`
+        invokes on its own thread, so all state changes go through the
+        thread-safe :class:`~llamactl.state.InstanceTracker`.
+
+        For a ``die``/``stop`` event on the managed container the
+        ``self._expected_stop`` flag (set by :meth:`stop` and the stop
+        half of :meth:`reload`) distinguishes a self-initiated shutdown
+        from an unexpected death:
+
+        * flag set  -> the tracker moves to ``stopped`` and the flag is
+          cleared; a deliberate shutdown is never a crash;
+        * flag unset and the tracker not already ``stopped`` or
+          ``suspended`` -> the tracker moves to ``crashed`` with the exit
+          code taken from the event (``exitCode`` field, falling back to
+          :meth:`Podman.exit_code`) and the last 50 log lines from
+          :meth:`Podman.logs` stored in ``log_tail``.
+
+        Any other event (e.g. ``start``) is ignored.  No automatic
+        restart is attempted here -- crashes are only detected and
+        reported.
+        """
+        action = event.get("Action")
+        if action not in _ENDING_EVENT_ACTIONS:
+            return
+        name = event.get("name")
+        if name != self._common.container_name:
+            return
+        if self._expected_stop:
+            # Self-initiated shutdown (stop or the stop half of a
+            # reload): report stopped and clear the flag so the next
+            # unannounced death is judged on its own.
+            self._expected_stop = False
+            self._tracker.transition(InstanceState.STOPPED)
+            return
+        current = self._tracker.snapshot().state
+        if current in _GONE_STATES:
+            # Already reported gone; a late or duplicate ending event
+            # must not turn a stopped/suspended instance into crashed.
+            return
+        exit_code = event.get("exitCode")
+        if exit_code is None:
+            try:
+                exit_code = self._podman.exit_code(name)
+            except PodmanError:
+                exit_code = None
+        if exit_code is not None:
+            exit_code = int(exit_code)
+        log_tail = self._podman.logs(name, tail=50)
+        self._tracker.transition(
+            InstanceState.CRASHED,
+            exit_code=exit_code,
+            log_tail=log_tail,
+        )
