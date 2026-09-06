@@ -29,6 +29,7 @@ and never kill the watcher thread.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -54,12 +55,15 @@ PROCESS_EXIT_TIMEOUT_SECONDS = 5.0
 
 
 def _match_fields(line: str) -> tuple[str, str, str, str]:
-    """Split one logind monitor line into (interface, member, arg, sender).
+    """Split one logind monitor line into (sender, interface, member, arg).
 
     The field position depends on the tool:
 
     * ``busctl --user monitor`` prints
-      ``<timestamp> <sender> <interface> <member> <arg...>``;
+      ``<date> <time> <sender> <interface> <member> <arg...>`` (some
+      builds merge date and time into one token); the interface is
+      recognised by its dotted shape, so the leading timestamp tokens
+      are skipped automatically;
     * ``dbus-monitor`` prints
       ``signal <path> <interface> <member> <arg...>  (sender=<sender>)``.
 
@@ -71,11 +75,19 @@ def _match_fields(line: str) -> tuple[str, str, str, str]:
         member = tokens[3] if len(tokens) > 3 else ""
         arg = tokens[4] if len(tokens) > 4 else ""
         sender = line.rsplit("sender=", 1)[-1].lstrip(")(").strip()
-        return (interface, member, arg, sender)
-    if len(tokens) >= 3:
-        sender, interface, member = tokens[0], tokens[1], tokens[2]
-        arg = tokens[3] if len(tokens) > 3 else ""
-        return (interface, member, arg, sender)
+        return (sender, interface, member, arg)
+    # busctl style: find the interface token (dotted, not a timestamp,
+    # not a path) and take the member and first argument after it.
+    for index, token in enumerate(tokens):
+        if (
+            token.count(".") >= 2
+            and not token[:1].isdigit()
+            and not token.startswith("/")
+        ):
+            interface = token
+            member = tokens[index + 1] if index + 1 < len(tokens) else ""
+            arg = tokens[index + 2] if index + 2 < len(tokens) else ""
+            return ("", interface, member, arg)
     return ("", "", "", "")
 
 
@@ -140,7 +152,7 @@ class PowerStateWatcher:
         Returns ``True`` when the host is about to suspend, ``False`` when
         it just resumed, and ``None`` for any line that is irrelevant.
         """
-        interface, member, arg, _sender = _match_fields(line)
+        _sender, interface, member, arg = _match_fields(line)
         if interface != LOGIND_INTERFACE or member != "PrepareForSleep":
             return None
         if arg == "true":
@@ -188,12 +200,16 @@ class PowerStateWatcher:
     def _open_stream(self) -> subprocess.Popen:
         """Start the monitor subprocess and register it for termination."""
         cmd = self._monitor_command()
+        # stdout is unbuffered in the child so signal lines reach the
+        # reader immediately even under python-style monitors.
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
+            env=env,
         )
         with self._proc_lock:
             self._proc = proc
