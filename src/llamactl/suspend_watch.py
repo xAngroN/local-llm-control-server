@@ -70,24 +70,26 @@ def _match_fields(line: str) -> tuple[str, str, str, str]:
     Returns empty strings for the pieces that are absent.
     """
     tokens = line.split()
+    sender = ""
     if tokens[:1] == ["signal"]:
+        # dbus-monitor: signal <path> <interface> <member> <arg...>
         interface = tokens[2] if len(tokens) > 2 else ""
         member = tokens[3] if len(tokens) > 3 else ""
         arg = tokens[4] if len(tokens) > 4 else ""
-        sender = line.rsplit("sender=", 1)[-1].lstrip(")(").strip()
+        sender = line.rsplit("sender=", 1)[-1].strip("() ")
         return (sender, interface, member, arg)
-    # busctl style: find the interface token (dotted, not a timestamp,
-    # not a path) and take the member and first argument after it.
+    # busctl style: find the token that names the logind interface
+    # (exact match preferred, suffix match as fallback) and take the
+    # member plus first argument after it.
     for index, token in enumerate(tokens):
-        if (
-            token.count(".") >= 2
-            and not token[:1].isdigit()
-            and not token.startswith("/")
-        ):
-            interface = token
-            member = tokens[index + 1] if index + 1 < len(tokens) else ""
-            arg = tokens[index + 2] if index + 2 < len(tokens) else ""
-            return ("", interface, member, arg)
+        if not token.startswith("org.") or token.startswith("/ "):
+            continue
+        if token != LOGIND_INTERFACE and not token.endswith("." + LOGIND_INTERFACE):
+            continue
+        interface = token
+        member = tokens[index + 1] if index + 1 < len(tokens) else ""
+        arg = tokens[index + 2] if index + 2 < len(tokens) else ""
+        return ("", interface, member, arg)
     return ("", "", "", "")
 
 
@@ -234,10 +236,18 @@ class PowerStateWatcher:
         self._tracker.transition(InstanceState.SUSPENDED)
 
     def _handle_resume(self) -> None:
-        """Invoke the resume callback exactly once per cycle."""
+        """Invoke the resume callback exactly once per suspend/resume cycle.
+
+        The callback fires only when a suspend was remembered for this
+        cycle; duplicate ``PrepareForSleep false`` signals (e.g. several
+        monitors delivering the same transition) are ignored, and the
+        remembered state is cleared afterwards.
+        """
         with self._state_lock:
-            self._resume_calls += 1
+            if self._pre_suspend_state is None:
+                return
             self._pre_suspend_state = None
+            self._resume_calls += 1
         try:
             self._on_resume()
         except Exception:  # noqa: BLE001 - never kill the watcher thread

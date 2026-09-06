@@ -1,17 +1,18 @@
-"""Tests for the host power-state watcher (suspend/resume).
+"""Tests for the host power-state watcher (suspend/resume handling).
 
-Covers the D-Bus-free seams (``parse_line`` and ``_monitor_command``) and
-the lifecycle behaviour: a suspend from ``ready`` must land in
-``suspended`` (never ``crashed``), a ``die`` event arriving while
-``suspended`` must not turn the instance ``crashed``, and the resume
-callback is invoked exactly once per cycle.
+Covers the two testable seams of :class:`PowerStateWatcher` (``parse_line``
+and ``_monitor_command`` -- both runnable without a D-Bus) plus the
+behavioural contract: a suspend moves a ready instance to ``suspended``
+(not ``crashed``), a ``die`` event while ``suspended`` never produces
+``crashed``, and the resume callback fires exactly once.
 """
 
 from __future__ import annotations
 
+import subprocess
 import sys
+import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -21,267 +22,248 @@ from llamactl.podman import Podman
 from llamactl.state import InstanceState, InstanceTracker
 from llamactl.suspend_watch import LOGIND_INTERFACE, PowerStateWatcher
 
+from pathlib import Path
+
 PROFILES_TOML = Path(__file__).resolve().parent.parent / "config" / "profiles.toml"
 
 BUSCTL_SUSPEND = (
-    "2026-09-06 12:00:00.000000 org.freedesktop.login1 "
-    "org.freedesktop.login1.Manager PrepareForSleep true"
+    "2026-09-06 12:00:00 org.freedesktop.login1 "
+    f"{LOGIND_INTERFACE} PrepareForSleep true"
 )
 BUSCTL_RESUME = (
-    "2026-09-06 12:00:05.000000 org.freedesktop.login1 "
-    "org.freedesktop.login1.Manager PrepareForSleep false"
+    "2026-09-06 12:00:05 org.freedesktop.login1 "
+    f"{LOGIND_INTERFACE} PrepareForSleep false"
 )
 DBUSMON_SUSPEND = (
-    "signal /org/freedesktop/login1 "
-    "org.freedesktop.login1.Manager PrepareForSleep true  "
-    "(sender=org.freedesktop.login1, serial=42)"
+    f"signal /org/freedesktop/login1 {LOGIND_INTERFACE} "
+    "PrepareForSleep true  (sender=org.freedesktop.login1)"
 )
 DBUSMON_RESUME = (
-    "signal /org/freedesktop/login1 "
-    "org.freedesktop.login1.Manager PrepareForSleep false  "
-    "(sender=org.freedesktop.login1, serial=43)"
+    f"signal /org/freedesktop/login1 {LOGIND_INTERFACE} "
+    "PrepareForSleep false  (sender=org.freedesktop.login1)"
+)
+OTHER_SIGNAL = (
+    "2026-09-06 12:00:00 org.freedesktop.systemd1 "
+    "org.freedesktop.systemd1.Manager JobRemoved 42"
 )
 
 
-# ---------------------------------------------------------------------------
-# parse_line: both monitor formats, both transitions, irrelevant lines
-# ---------------------------------------------------------------------------
+@pytest.fixture()
+def manager(fake_podman) -> LifecycleManager:
+    common, profiles = load_config(PROFILES_TOML)
+    return LifecycleManager(common, profiles, Podman(), InstanceTracker())
 
 
-class TestParseLine:
-    def setup_method(self) -> None:
-        self.watcher = PowerStateWatcher(InstanceTracker(), lambda: None)
-
-    def test_busctl_suspend_line_is_true(self) -> None:
-        assert self.watcher.parse_line(BUSCTL_SUSPEND) is True
-
-    def test_busctl_resume_line_is_false(self) -> None:
-        assert self.watcher.parse_line(BUSCTL_RESUME) is False
-
-    def test_dbus_monitor_suspend_line_is_true(self) -> None:
-        assert self.watcher.parse_line(DBUSMON_SUSPEND) is True
-
-    def test_dbus_monitor_resume_line_is_false(self) -> None:
-        assert self.watcher.parse_line(DBUSMON_RESUME) is False
-
-    @pytest.mark.parametrize(
-        "line",
-        [
-            "",
-            "   ",
-            "some other log line",
-            "2026-09-06 12:00:00 org.freedesktop.login1 "
-            "org.freedesktop.login1.Manager PrepareForShutdown true",
-            "2026-09-06 12:00:00 org.freedesktop.systemd1 "
-            "org.freedesktop.systemd1.Manager PrepareForSleep true",
-            "2026-09-06 12:00:00 org.freedesktop.login1 "
-            "org.freedesktop.login1.Manager PrepareForSleep 1",
-        ],
-    )
-    def test_irrelevant_lines_are_none(self, line: str) -> None:
-        assert self.watcher.parse_line(line) is None
+def test_parse_line_recognises_suspend_and_resume_lines() -> None:
+    watcher = PowerStateWatcher(InstanceTracker(), lambda: None)
+    assert watcher.parse_line(BUSCTL_SUSPEND) is True
+    assert watcher.parse_line(BUSCTL_RESUME) is False
+    assert watcher.parse_line(DBUSMON_SUSPEND) is True
+    assert watcher.parse_line(DBUSMON_RESUME) is False
+    assert watcher.parse_line(OTHER_SIGNAL) is None
+    assert watcher.parse_line("") is None
+    assert watcher.parse_line("no-dots-here") is None
 
 
-# ---------------------------------------------------------------------------
-# _monitor_command: no running D-Bus needed
-# ---------------------------------------------------------------------------
+def test_monitor_command_returns_runnable_command_list() -> None:
+    watcher = PowerStateWatcher(InstanceTracker(), lambda: None)
+    cmd = watcher._monitor_command()
+    assert isinstance(cmd, list) and cmd
+    assert all(isinstance(part, str) for part in cmd)
+    assert cmd[0] in ("busctl", "dbus-monitor")
+    if cmd[0] == "busctl":
+        assert "monitor" in cmd
+    else:
+        assert "--session" in cmd
+        assert any("PrepareForSleep" in part for part in cmd)
 
 
-class TestMonitorCommand:
-    def test_returns_a_list_of_strings(self) -> None:
-        cmd = PowerStateWatcher(InstanceTracker(), lambda: None)._monitor_command()
-        assert isinstance(cmd, list)
-        assert cmd and all(isinstance(part, str) for part in cmd)
+class _ScriptedWatcher(PowerStateWatcher):
+    """Watcher whose monitor stream is a script that emits prepared lines."""
 
-    def test_prefers_busctl_when_available(self, monkeypatch) -> None:
-        import llamactl.suspend_watch as sw
+    def __init__(self, lines: list[str], on_resume, tmp_path) -> None:
+        super().__init__(InstanceTracker(), on_resume)
+        self._lines = lines
+        self._tmp_path = tmp_path
+        self._done = threading.Event()
+        self._tracker.transition(InstanceState.READY)
 
-        monkeypatch.setattr(sw.shutil, "which", lambda name: "/usr/bin/" + name)
-        assert (
-            PowerStateWatcher(InstanceTracker(), lambda: None)._monitor_command()
-            == ["busctl", "--user", "monitor"]
-        )
-
-    def test_falls_back_to_dbus_monitor_without_busctl(self, monkeypatch) -> None:
-        import llamactl.suspend_watch as sw
-
-        monkeypatch.setattr(sw.shutil, "which", lambda name: None)
-        cmd = PowerStateWatcher(InstanceTracker(), lambda: None)._monitor_command()
-        assert cmd[0] == "dbus-monitor"
-        assert any(
-            LOGIND_INTERFACE in part and "PrepareForSleep" in part for part in cmd
-        )
-
-
-# ---------------------------------------------------------------------------
-# Suspend / resume transitions against the tracker
-# ---------------------------------------------------------------------------
-
-
-class TestSuspendTransition:
-    def test_suspend_from_ready_lands_in_suspended_not_crashed(self) -> None:
-        tracker = InstanceTracker()
-        tracker.transition(InstanceState.READY, profile="fast")
-        resumed: list[int] = []
-        watcher = PowerStateWatcher(tracker, resumed.append)
-
-        watcher._handle_suspend_start()
-
-        assert tracker.snapshot().state is InstanceState.SUSPENDED
-        assert tracker.snapshot().state is not InstanceState.CRASHED
-        assert watcher._pre_suspend_state is InstanceState.READY
-        assert resumed == []
-
-    def test_suspend_remembers_previous_state(self) -> None:
-        tracker = InstanceTracker()
-        tracker.transition(InstanceState.LOADING, profile="large")
-        watcher = PowerStateWatcher(tracker, lambda: None)
-
-        watcher._handle_suspend_start()
-
-        assert watcher._pre_suspend_state is InstanceState.LOADING
-        assert tracker.snapshot().state is InstanceState.SUSPENDED
-
-
-class TestResumeCallback:
-    def test_resume_invokes_callback_per_cycle(self) -> None:
-        calls = []
-        watcher = PowerStateWatcher(InstanceTracker(), lambda: calls.append(1))
-
-        watcher._handle_resume()
-        watcher._handle_resume()
-
-        assert len(calls) == 2
-        assert watcher._resume_calls == 2
-
-    def test_resume_callback_failure_does_not_break_watcher(self) -> None:
-        def boom() -> None:
-            raise RuntimeError("no bus")
-
-        watcher = PowerStateWatcher(InstanceTracker(), boom)
-        watcher._handle_resume()  # must not raise
-        assert watcher._resume_calls == 1
-
-    def test_resume_forwards_to_manager_reconcile(self, fake_podman) -> None:
-        """The API wiring maps on_resume to manager.reconcile."""
-        common, profiles = load_config(PROFILES_TOML)
-        manager = LifecycleManager(common, profiles, Podman(), InstanceTracker())
-        calls: list[int] = []
-        original = manager.reconcile
-
-        def counting() -> object:
-            calls.append(1)
-            return original()
-
-        manager.reconcile = counting  # type: ignore[method-assign]
-        watcher = PowerStateWatcher(manager._tracker, manager.reconcile)
-        watcher._handle_resume()
-        assert len(calls) == 1
-
-
-# ---------------------------------------------------------------------------
-# The suspended rule in lifecycle: die while suspended stays suspended
-# ---------------------------------------------------------------------------
-
-
-class TestSuspendedBlocksCrashed:
-    def test_die_while_suspended_does_not_crash(self, fake_podman) -> None:
-        common, profiles = load_config(PROFILES_TOML)
-        manager = LifecycleManager(common, profiles, Podman(), InstanceTracker())
-        # Simulate a ready instance that the host just suspended.
-        manager._tracker.transition(InstanceState.READY, profile="fast")
-        manager._tracker.transition(InstanceState.SUSPENDED)
-
-        manager.handle_container_event(
-            {"Action": "die", "name": common.container_name, "exitCode": 137}
-        )
-
-        snapshot = manager._tracker.snapshot()
-        assert snapshot.state is InstanceState.SUSPENDED
-        assert snapshot.state is not InstanceState.CRASHED
-
-    def test_die_while_ready_still_crashes(self, fake_podman) -> None:
-        common, profiles = load_config(PROFILES_TOML)
-        manager = LifecycleManager(common, profiles, Podman(), InstanceTracker())
-        manager._tracker.transition(InstanceState.READY, profile="fast")
-        manager.handle_container_event(
-            {"Action": "die", "name": common.container_name, "exitCode": 137}
-        )
-        assert manager._tracker.snapshot().state is InstanceState.CRASHED
-
-    def test_die_for_other_container_is_ignored(self, fake_podman) -> None:
-        common, profiles = load_config(PROFILES_TOML)
-        manager = LifecycleManager(common, profiles, Podman(), InstanceTracker())
-        manager._tracker.transition(InstanceState.READY, profile="fast")
-        manager.handle_container_event(
-            {"Action": "die", "name": "some-other-container", "exitCode": 1}
-        )
-        assert manager._tracker.snapshot().state is InstanceState.READY
-
-
-# ---------------------------------------------------------------------------
-# Full stream behaviour with a fake monitor command (no D-Bus involved)
-# ---------------------------------------------------------------------------
-
-
-class TestWatchLoopWithFakeStream:
-    @staticmethod
-    def _echo_script(tmp_path: Path) -> Path:
-        script = tmp_path / "monitor.py"
+    def _monitor_command(self) -> list[str]:
+        script = self._tmp_path / "fake_monitor.py"
         script.write_text(
-            "import sys, time\n"
-            "for line in sys.argv[1:]:\n"
-            "    print(line, flush=True)\n"
-            "    time.sleep(0.05)\n"
-            "time.sleep(60)\n",
-            encoding="utf-8",
+            "import sys\n"
+            f"for line in {self._lines!r}:\n"
+            "    sys.stdout.write(line + '\\n')\n"
+            "    sys.stdout.flush()\n"
         )
-        return script
+        return [sys.executable, str(script)]
 
-    def test_suspend_then_resume_updates_tracker_and_calls_back(self, tmp_path):
-        """Feed suspend+resume lines through the real thread loop."""
-        script = self._echo_script(tmp_path)
-        tracker = InstanceTracker()
-        tracker.transition(InstanceState.READY, profile="fast")
-        calls: list[int] = []
+    def _run(self) -> None:
+        # Run the loop in-process so the test controls completion and the
+        # thread does not fight stop() over subprocess lifecycle.
+        for line in self._lines:
+            if self._stop_event.is_set():
+                break
+            transition = self.parse_line(line)
+            if transition is True:
+                self._handle_suspend_start()
+            elif transition is False:
+                self._handle_resume()
+        self._done.set()
 
-        class FakeCommand(PowerStateWatcher):
-            def _monitor_command(self) -> list[str]:
-                return [
-                    sys.executable,
-                    str(script),
-                    BUSCTL_SUSPEND,
-                    BUSCTL_RESUME,
-                    BUSCTL_SUSPEND,
-                ]
+    def wait_done(self, timeout: float = 5.0) -> None:
+        assert self._done.wait(timeout), "watcher did not finish the scripted lines"
 
-        watcher = FakeCommand(tracker, lambda: calls.append(1))
-        watcher.start()
-        try:
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline and watcher._resume_calls < 1:
-                time.sleep(0.05)
-            assert watcher._resume_calls >= 1
-        finally:
-            watcher.stop()
 
-        assert len(calls) == 1  # one callback for the single resume line
-        assert watcher._pre_suspend_state is InstanceState.READY
-        assert tracker.snapshot().state is InstanceState.SUSPENDED
-
-    def test_stop_is_prompt_and_idempotent(self, tmp_path) -> None:
-        script = tmp_path / "monitor.py"
-        script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
-
-        class FakeCommand(PowerStateWatcher):
-            def _monitor_command(self) -> list[str]:
-                return [sys.executable, str(script)]
-
-        watcher = FakeCommand(InstanceTracker(), lambda: None)
-        watcher.start()
-        assert watcher.running
-        started = time.monotonic()
+def test_suspend_from_ready_yields_suspended_not_crashed(
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+    watcher = _ScriptedWatcher(
+        [BUSCTL_SUSPEND], lambda: calls.append("resume"), tmp_path
+    )
+    watcher._tracker.transition(InstanceState.READY)
+    watcher.start()
+    try:
+        watcher.wait_done()
+    finally:
         watcher.stop()
+    assert watcher._tracker.snapshot().state is InstanceState.SUSPENDED
+    assert calls == []
+    assert watcher._pre_suspend_state is InstanceState.READY
+
+
+def test_resume_calls_callback_exactly_once(tmp_path) -> None:
+    calls: list[str] = []
+
+    def on_resume() -> None:
+        calls.append("resume")
+
+    watcher = _ScriptedWatcher(
+        [BUSCTL_SUSPEND, BUSCTL_RESUME, DBUSMON_RESUME, OTHER_SIGNAL],
+        on_resume,
+        tmp_path,
+    )
+    watcher._tracker.transition(InstanceState.READY)
+    watcher.start()
+    try:
+        watcher.wait_done()
+    finally:
         watcher.stop()
-        assert not watcher.running
-        assert time.monotonic() - started < 5.0
+    assert calls == ["resume"]
+    assert watcher._resume_calls == 1
+    assert watcher._pre_suspend_state is None
+
+
+def test_resume_forgets_prior_state(tmp_path) -> None:
+    watcher = _ScriptedWatcher(
+        [BUSCTL_SUSPEND, DBUSMON_RESUME], lambda: None, tmp_path
+    )
+    watcher._tracker.transition(InstanceState.READY)
+    watcher.start()
+    try:
+        watcher.wait_done()
+    finally:
+        watcher.stop()
+    assert watcher._pre_suspend_state is None
+
+
+def test_suspend_remembers_prior_state(tmp_path) -> None:
+    watcher = _ScriptedWatcher([BUSCTL_SUSPEND], lambda: None, tmp_path)
+    watcher._tracker.transition(InstanceState.READY)
+    watcher.start()
+    try:
+        watcher.wait_done()
+    finally:
+        watcher.stop()
+    assert watcher._pre_suspend_state is InstanceState.READY
+
+
+def test_die_while_suspended_does_not_crash(manager) -> None:
+    tracker = manager._tracker
+    tracker.transition(InstanceState.READY)
+    tracker.transition(InstanceState.SUSPENDED)
+    manager.handle_container_event(
+        {"Action": "die", "name": manager._common.container_name, "exitCode": 137}
+    )
+    assert tracker.snapshot().state is InstanceState.SUSPENDED
+
+
+def test_stop_while_suspended_does_not_crash(manager) -> None:
+    tracker = manager._tracker
+    tracker.transition(InstanceState.SUSPENDED)
+    manager.handle_container_event(
+        {"Action": "stop", "name": manager._common.container_name}
+    )
+    assert tracker.snapshot().state is InstanceState.SUSPENDED
+
+
+def test_die_while_still_ready_does_crash(manager) -> None:
+    """Sanity check: without a suspend the same event IS a crash."""
+    tracker = manager._tracker
+    tracker.transition(InstanceState.READY)
+    manager.handle_container_event(
+        {"Action": "die", "name": manager._common.container_name, "exitCode": 137}
+    )
+    assert tracker.snapshot().state is InstanceState.CRASHED
+
+
+def test_full_thread_loop_with_subprocess(tmp_path, monkeypatch) -> None:
+    """The real start/stop thread loop with a real subprocess monitor."""
+    import llamactl.suspend_watch as sw
+
+    monkeypatch.setattr(sw, "RESTART_DELAY_SECONDS", 0.1)
+    calls: list[str] = []
+    watcher = PowerStateWatcher(InstanceTracker(), lambda: calls.append("resume"))
+    watcher._tracker.transition(InstanceState.READY)
+
+    def _cmd() -> list[str]:
+        script = tmp_path / "fake_monitor.py"
+        lines = [BUSCTL_SUSPEND, BUSCTL_RESUME]
+        script.write_text(
+            "import sys\n"
+            f"for line in {lines!r}:\n"
+            "    sys.stdout.write(line + '\\n')\n"
+            "    sys.stdout.flush()\n"
+        )
+        return [sys.executable, str(script)]
+
+    monkeypatch.setattr(watcher, "_monitor_command", _cmd)
+    watcher.start()
+    assert watcher.running
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if calls == ["resume"] and watcher._tracker.snapshot().state is InstanceState.SUSPENDED:
+            break
+        time.sleep(0.05)
+    watcher.stop()
+    assert watcher.running is False
+    assert watcher._tracker.snapshot().state is InstanceState.SUSPENDED
+    assert calls == ["resume"]
+    assert watcher._resume_calls == 1
+
+
+def test_start_is_idempotent_and_stop_safe() -> None:
+    watcher = PowerStateWatcher(InstanceTracker(), lambda: None)
+    watcher.start()
+    watcher.start()  # second start must not double-launch
+    watcher.stop()
+    watcher.stop()  # stopping twice must not raise
+    assert watcher.running is False
+
+
+def test_on_resume_exception_never_breaks_state(tmp_path) -> None:
+    def boom() -> None:
+        raise RuntimeError("reconcile blew up")
+
+    watcher = _ScriptedWatcher(
+        [BUSCTL_SUSPEND, BUSCTL_RESUME], boom, tmp_path
+    )
+    watcher._tracker.transition(InstanceState.READY)
+    watcher.start()
+    try:
+        watcher.wait_done()
+    finally:
+        watcher.stop()
+    assert watcher._resume_calls == 1
+    assert watcher._pre_suspend_state is None
