@@ -23,6 +23,9 @@ from .state import InstanceState, InstanceStatus, InstanceTracker
 _INACTIVE_STATES = (InstanceState.STOPPED, InstanceState.CRASHED)
 
 
+PROFILE_LABEL = "llamactl.profile"
+
+
 class UnknownProfileError(ValueError):
     """Raised when a start is requested for a profile that is not configured."""
 
@@ -90,6 +93,9 @@ class LifecycleManager:
         self._tracker.transition(InstanceState.STARTING)
         profile = self._profiles[profile_name]
         args = render_podman_args(profile, self._common)
+        # Tag the container with its profile so a restarted manager can
+        # recover the active profile name via ``reconcile``.
+        args.extend(["--label", f"{PROFILE_LABEL}={profile_name}"])
         try:
             container_id = self._podman.start_container(args)
         except PodmanError as err:
@@ -138,6 +144,79 @@ class LifecycleManager:
         self._podman.stop_container(self._common.container_name)
         self._tracker.transition(InstanceState.STOPPED)
         return self._tracker.snapshot()
+
+    def reconcile(self) -> InstanceStatus:
+        """Adopt the real podman state at API-server startup.
+
+        Compares the actual container state against the manager's own
+        (always empty) startup state and reports it, without starting or
+        stopping anything:
+
+        * no container -> ``stopped``;
+        * exited container -> ``stopped`` with the exit code taken over
+          into :attr:`InstanceStatus.exit_code`;
+        * running container -> ``loading`` with the container ID and the
+          profile name read from the ``llamactl.profile`` label set by
+          :meth:`_start_locked`. A running container whose profile cannot
+          be derived is still adopted, with ``profile = None`` and an
+          explanatory :attr:`InstanceStatus.message`.
+        """
+        with self._lock:
+            return self._reconcile_locked()
+
+    def _reconcile_locked(self) -> InstanceStatus:
+        """Reconcile flow; the caller must already hold :attr:`_lock`."""
+        info = self._podman.inspect(self._common.container_name)
+        if info is None:
+            self._tracker.transition(InstanceState.STOPPED)
+            return self._tracker.snapshot()
+
+        state = info.get("State") or {}
+        container_id = info.get("Id") or info.get("ID")
+        if state.get("Running"):
+            profile, message = self._profile_from_container(info)
+            self._tracker.transition(
+                InstanceState.LOADING,
+                profile=profile,
+                container_id=container_id,
+                message=message,
+            )
+        else:
+            exit_code = state.get("ExitCode")
+            self._tracker.transition(
+                InstanceState.STOPPED, exit_code=exit_code
+            )
+        return self._tracker.snapshot()
+
+    def _profile_from_container(self, info: dict) -> tuple[str | None, str | None]:
+        """Recover the profile name of a running container.
+
+        Checks the ``llamactl.profile`` label first, then the stored
+        container arguments (as the fake podman records them). Returns
+        ``(profile, message)``; when the profile cannot be derived the
+        message explains that an orphaned container was adopted.
+        """
+        labels = info.get("Labels")
+        if isinstance(labels, dict):
+            candidate = labels.get(PROFILE_LABEL)
+            if candidate in self._profiles:
+                return candidate, None
+        for arg in info.get("Args") or []:
+            if isinstance(arg, str):
+                if arg.startswith(f"{PROFILE_LABEL}="):
+                    candidate = arg.partition("=")[2]
+                elif arg.startswith("--label") and f"{PROFILE_LABEL}=" in arg:
+                    candidate = arg.partition(f"{PROFILE_LABEL}=")[2]
+                else:
+                    continue
+                if candidate in self._profiles:
+                    return candidate, None
+        return (
+            None,
+            f"adopted orphaned running container "
+            f"{self._common.container_name!r}: profile "
+            f"({PROFILE_LABEL}) could not be derived from container",
+        )
 
     def reload(self, profile_name: str) -> InstanceStatus:
         """Switch the running instance to ``profile_name`` atomically.

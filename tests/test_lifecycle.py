@@ -8,6 +8,7 @@ import pytest
 
 from llamactl.config import load_config
 from llamactl.lifecycle import (
+    PROFILE_LABEL,
     AlreadyRunningError,
     LifecycleManager,
     UnknownProfileError,
@@ -75,6 +76,7 @@ def test_start_creates_running_container_with_profile_args(
     assert args is not None
     assert _arg_after(args, "--ctx-size") == EXPECTED_CTX[name]
     assert _arg_after(args, "--parallel") == EXPECTED_PARALLEL[name]
+    assert _arg_after(args, "--label") == f"{PROFILE_LABEL}={name}"
 
 
 def test_unknown_profile_raises_without_podman_or_tracker_touch(
@@ -308,3 +310,152 @@ def test_stop_with_nothing_running_is_not_an_error(fake_podman) -> None:
     assert status.profile is None
     assert fake_podman.containers() == {}
     assert tracker.snapshot().state is InstanceState.STOPPED
+
+
+def test_reconcile_empty_podman_state_reports_stopped(fake_podman) -> None:
+    """Reconciling with no container at all reports stopped."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    status = mgr.reconcile()
+
+    assert status.state is InstanceState.STOPPED
+    assert status.profile is None
+    assert status.container_id is None
+    assert status.exit_code is None
+    assert status.message is None
+    assert fake_podman.containers() == {}
+
+
+def test_reconcile_adopts_preexisting_running_container_with_label(
+    fake_podman,
+) -> None:
+    """A running container written into the fake state is adopted with id and profile."""
+    common, profiles = load_config(PROFILES_TOML)
+    name = common.container_name
+    container_id = "abc123def456"
+    state = {
+        name: {
+            "id": container_id,
+            "status": "running",
+            "exit_code": None,
+            "run_args": [
+                "run",
+                "--name",
+                name,
+                "image",
+                "--label",
+                f"{PROFILE_LABEL}=safe",
+            ],
+            "logs": [],
+        }
+    }
+    fake_podman._write(state)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    status = mgr.reconcile()
+
+    assert status.state is InstanceState.LOADING
+    assert status.profile == "safe"
+    assert status.container_id == container_id
+    assert status.message is None
+    snap = mgr._tracker.snapshot()
+    assert snap.state is InstanceState.LOADING
+    assert snap.profile == "safe"
+    assert snap.container_id == container_id
+    # Reconcile only observes: nothing was started or stopped.
+    assert fake_podman.containers()[name]["status"] == "running"
+
+
+def test_reconcile_running_container_without_profile_label(
+    fake_podman,
+) -> None:
+    """A running container with no derivable profile is adopted with message, not an exception."""
+    common, profiles = load_config(PROFILES_TOML)
+    name = common.container_name
+    container_id = "f00feed00f12"
+    state = {
+        name: {
+            "id": container_id,
+            "status": "running",
+            "exit_code": None,
+            "run_args": ["run", "--name", name, "image"],
+            "logs": [],
+        }
+    }
+    fake_podman._write(state)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    status = mgr.reconcile()
+
+    assert status.state is InstanceState.LOADING
+    assert status.profile is None
+    assert status.container_id == container_id
+    assert status.message is not None
+    assert "llamactl.profile" in status.message
+    snap = mgr._tracker.snapshot()
+    assert snap.state is InstanceState.LOADING
+    assert snap.profile is None
+    assert snap.container_id == container_id
+
+
+def test_reconcile_after_manager_restart_finds_running_instance(fake_podman) -> None:
+    """After a simulated manager restart (fresh tracker + manager) reconcile re-adopts the instance."""
+    common, profiles = load_config(PROFILES_TOML)
+    name = common.container_name
+    first_tracker = InstanceTracker()
+    first = LifecycleManager(common, profiles, Podman(), first_tracker)
+
+    started = first.start("large")
+    entry = fake_podman.containers()[name]
+    assert entry["status"] == "running"
+    assert started.state is InstanceState.LOADING
+    assert started.profile == "large"
+
+    # Simulate an API-server restart: brand-new tracker and manager, but
+    # the same fake podman state (the container keeps running).
+    restarted = LifecycleManager(common, profiles, Podman(), InstanceTracker())
+
+    status = restarted.reconcile()
+
+    assert status.state is InstanceState.LOADING
+    assert status.profile == "large"
+    assert status.container_id == entry["id"]
+    assert status.container_id == started.container_id
+    assert status.message is None
+    snap = restarted._tracker.snapshot()
+    assert snap.state is InstanceState.LOADING
+    assert snap.profile == "large"
+    assert snap.container_id == entry["id"]
+    # Still exactly one container, untouched by reconcile.
+    assert len(fake_podman.containers()) == 1
+    assert fake_podman.containers()[name]["status"] == "running"
+
+
+def test_reconcile_exited_container_reports_stopped_with_exit_code(fake_podman) -> None:
+    """An exited container is reported as stopped with the exit code taken over."""
+    common, profiles = load_config(PROFILES_TOML)
+    name = common.container_name
+    container_id = "deadbeef0042"
+    state = {
+        name: {
+            "id": container_id,
+            "status": "exited",
+            "exit_code": 137,
+            "run_args": ["run", "--name", name, "image"],
+            "logs": [],
+        }
+    }
+    fake_podman._write(state)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    status = mgr.reconcile()
+
+    assert status.state is InstanceState.STOPPED
+    assert status.exit_code == 137
+    assert status.profile is None
+    assert status.container_id is None
