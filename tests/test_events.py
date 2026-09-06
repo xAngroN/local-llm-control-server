@@ -17,7 +17,7 @@ import time
 import pytest
 
 from llamactl.events import ContainerEventWatcher
-from llamactl.podman import Podman
+from llamactl.podman import EventStream, Podman
 
 DEADLINE_SECONDS = 2.0
 NAME = "watched"
@@ -113,25 +113,13 @@ def test_stop_preempts_thread_blocked_on_live_stream(fake_podman) -> None:
         """
 
         def events(self, filters, handle=None):
-            cmd = [self.binary, "events", "--format", "json", *filters]
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
-            )
-            if handle is not None:
-                handle(proc)
-            procs.append(proc)
-            got.set()
-            try:
-                for line in proc.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-            finally:
-                pass  # process cleanup is the watcher's job via the handle
+            def _record(proc):
+                procs.append(proc)
+                got.set()
+                if handle is not None:
+                    handle(proc)
+
+            return EventStream(self, filters, _record)
 
     podman = _LiveStream()
     received: list[dict] = []
