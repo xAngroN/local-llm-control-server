@@ -35,7 +35,8 @@ if args[:1] == ["inspect"]:
         sys.stderr.write('Error: no such container: missing\n')
         sys.exit(125)
     state = {"Running": name == "up", "ExitCode": 3 if name == "crashed" else 0}
-    print(json.dumps({"State": state}))
+    # real ``podman inspect --format json <name>`` returns a JSON *array*
+    print(json.dumps([{"State": state}]))
     sys.exit(0)
 
 if args[:1] == ["logs"]:
@@ -124,6 +125,14 @@ def test_inspect_existing_returns_dict(fake_podman) -> None:
     info = p.inspect("up")
     assert isinstance(info, dict)
     assert info["State"]["Running"] is True
+
+
+def test_inspect_unwraps_array_output(fake_podman) -> None:
+    # podman emits a JSON array for a single name; inspect() must return the dict.
+    p = Podman(binary=fake_podman)
+    info = p.inspect("crashed")
+    assert isinstance(info, dict)
+    assert info["State"]["ExitCode"] == 3
 
 
 def test_is_running(fake_podman) -> None:

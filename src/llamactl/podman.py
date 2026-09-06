@@ -70,7 +70,11 @@ class Podman:
             if "no such container" in err.stderr.lower():
                 return None
             raise
-        return json.loads(out)
+        data = json.loads(out)
+        # Real ``podman inspect`` emits a JSON array (one element per name).
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data
 
     def is_running(self, name: str) -> bool:
         """Return whether the container currently has a running state."""
