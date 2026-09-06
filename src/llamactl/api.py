@@ -13,6 +13,8 @@ from fastapi import Body, FastAPI, HTTPException
 
 from llamactl import __version__
 from llamactl.config import load_config
+from llamactl.events import ContainerEventWatcher
+from llamactl.health import HealthPoller
 from llamactl.lifecycle import (
     AlreadyRunningError,
     LifecycleManager,
@@ -56,6 +58,16 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
         )
     tracker = manager._tracker
     collector = MetricsCollector()
+    # Event stream and health polling run in their own daemon threads and
+    # are started with the app, so the API server sees crashes and
+    # readiness without any HTTP request.  Both are torn down again on
+    # shutdown below.
+    watcher = ContainerEventWatcher(
+        manager._podman,
+        manager._common.container_name,
+        manager.handle_container_event,
+    )
+    poller = HealthPoller(tracker)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -63,7 +75,13 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             manager.reconcile()
         except PodmanError as err:
             logger.warning("startup reconcile failed: %s", err)
-        yield
+        watcher.start()
+        poller.start()
+        try:
+            yield
+        finally:
+            watcher.stop()
+            poller.stop()
 
     app = FastAPI(title="llamactl", lifespan=lifespan)
     app.state.manager = manager
