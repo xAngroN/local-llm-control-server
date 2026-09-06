@@ -183,9 +183,11 @@ class LifecycleManager:
             )
         else:
             exit_code = state.get("ExitCode")
-            self._tracker.transition(
-                InstanceState.STOPPED, exit_code=exit_code
-            )
+            self._tracker.transition(InstanceState.STOPPED)
+            # InstanceTracker.transition(STOPPED) resets instance fields
+            # and ignores extra kwargs, so the exit code is stored directly.
+            with self._tracker._lock:
+                self._tracker._status.exit_code = exit_code
         return self._tracker.snapshot()
 
     def _profile_from_container(self, info: dict) -> tuple[str | None, str | None]:

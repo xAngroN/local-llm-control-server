@@ -137,6 +137,22 @@ def cmd_stop(args: list[str], path: str, state: dict) -> None:
     _save(path, state)
 
 
+def _labels_from_args(run_args: list[str]) -> dict:
+    """Recover ``--label key=value`` pairs from the stored run args."""
+    labels: dict = {}
+    i = 0
+    while i < len(run_args):
+        if run_args[i] == "--label" and i + 1 < len(run_args):
+            pair = run_args[i + 1]
+            if "=" in pair:
+                key, _, value = pair.partition("=")
+                labels[key] = value
+            i += 2
+            continue
+        i += 1
+    return labels
+
+
 def cmd_inspect(args: list[str], path: str, state: dict) -> None:
     name = _name_after(args)
     entry = state.get(name)
@@ -145,7 +161,14 @@ def cmd_inspect(args: list[str], path: str, state: dict) -> None:
     state: dict = {"Running": entry["status"] == "running"}
     if entry["exit_code"] is not None:
         state["ExitCode"] = entry["exit_code"]
-    record = {"Id": entry["id"], "Name": name, "State": state}
+    run_args = entry.get("run_args") or []
+    record = {
+        "Id": entry["id"],
+        "Name": name,
+        "State": state,
+        "Labels": _labels_from_args(run_args),
+        "Args": list(run_args),
+    }
     sys.stdout.write(json.dumps([record]) + "\n")
 
 
