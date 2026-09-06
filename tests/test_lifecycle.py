@@ -354,9 +354,9 @@ def test_reconcile_adopts_preexisting_running_container_with_label(
                 "run",
                 "--name",
                 name,
-                "image",
                 "--label",
                 f"{PROFILE_LABEL}=safe",
+                "image",
             ],
             "logs": [],
         }

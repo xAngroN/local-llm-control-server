@@ -162,12 +162,18 @@ def cmd_inspect(args: list[str], path: str, state: dict) -> None:
     if entry["exit_code"] is not None:
         state["ExitCode"] = entry["exit_code"]
     run_args = entry.get("run_args") or []
+    # Emit the same shape real ``podman inspect --format json`` produces:
+    # top-level ``Id``/``State`` and a ``Config`` block carrying the
+    # container labels and command, so consumers rely on the real
+    # convention rather than fake-specific top-level keys.
     record = {
         "Id": entry["id"],
         "Name": name,
         "State": state,
-        "Labels": _labels_from_args(run_args),
-        "Args": list(run_args),
+        "Config": {
+            "Labels": _labels_from_args(run_args),
+            "Cmd": list(run_args),
+        },
     }
     sys.stdout.write(json.dumps([record]) + "\n")
 

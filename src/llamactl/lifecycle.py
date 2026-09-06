@@ -199,24 +199,26 @@ class LifecycleManager:
     def _profile_from_container(self, info: dict) -> tuple[str | None, str | None]:
         """Recover the profile name of a running container.
 
-        Checks the ``llamactl.profile`` label first, then the stored
-        container arguments (as the fake podman records them). Returns
-        ``(profile, message)``; when the profile cannot be derived the
-        message explains that an orphaned container was adopted.
+        Reads the ``llamactl.profile`` label from the inspect output, using
+        the real podman convention (``Config.Labels``) first, then the
+        command args for a label flag that was not materialised into a
+        label. Returns ``(profile, message)``; when the profile cannot be
+        derived the message explains that an orphaned container was adopted.
         """
-        labels = info.get("Labels")
-        if isinstance(labels, dict):
-            candidate = labels.get(PROFILE_LABEL)
-            if candidate in self._profiles:
-                return candidate, None
-        for arg in info.get("Args") or []:
-            if isinstance(arg, str):
-                if arg.startswith(f"{PROFILE_LABEL}="):
-                    candidate = arg.partition("=")[2]
-                elif arg.startswith("--label") and f"{PROFILE_LABEL}=" in arg:
-                    candidate = arg.partition(f"{PROFILE_LABEL}=")[2]
-                else:
-                    continue
+        config = info.get("Config") or {}
+        if not isinstance(config, dict):
+            config = {}
+        # Real ``podman inspect`` surfaces labels under ``Config.Labels``.
+        for source in (config.get("Labels"), info.get("Labels")):
+            if isinstance(source, dict):
+                candidate = source.get(PROFILE_LABEL)
+                if isinstance(candidate, str) and candidate in self._profiles:
+                    return candidate, None
+        # Fall back to a ``--label`` flag recorded in the command args.
+        cmd = config.get("Cmd") or info.get("Args") or []
+        for arg in cmd:
+            if isinstance(arg, str) and arg.startswith(f"{PROFILE_LABEL}="):
+                candidate = arg.partition("=")[2]
                 if candidate in self._profiles:
                     return candidate, None
         return (
