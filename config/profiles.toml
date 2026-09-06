@@ -34,3 +34,14 @@ kv_cache_type_k = "q8_0"
 kv_cache_type_v = "q8_0"
 parallel = 1
 batch_size = 512
+
+# `shared` teilt das bereits gemessene 32768-Token-Budget auf 4 Slots zu je
+# 8192 Token auf, statt ein neues, unvermessenes Speicherbudget aufzumachen;
+# der reale VRAM-Spitzenwert dieses Profils ist noch nicht gemessen.
+[profiles.shared]
+model = "safe.gguf"
+ctx_size = 32768
+kv_cache_type_k = "q8_0"
+kv_cache_type_v = "q8_0"
+parallel = 4
+batch_size = 512
