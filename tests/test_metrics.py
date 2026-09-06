@@ -125,6 +125,43 @@ def test_read_model_metrics_from_local_server(tmp_path) -> None:
     assert metrics["generation_tps"] == 30.0  # 300 / 10.0
 
 
+def test_read_model_metrics_unexpected_prometheus_names_yield_none(monkeypatch) -> None:
+    """A realistic llama.cpp /metrics payload without our expected names
+    must not raise -- throughput stays None instead of breaking /metrics."""
+    import httpx
+
+    import llamactl.metrics as metrics_module
+
+    real_llamacpp_output = """\
+    # HELP llama_load_time_seconds Time taken to load the model
+    # TYPE llama_load_time_seconds gauge
+    llama_load_time_seconds 1.234
+    # HELP llama_prompt_tokens Total tokens processed by the prompt
+    # TYPE llama_prompt_tokens counter
+    llama_prompt_tokens 0
+    # HELP llama_tokens_predicted Total tokens predicted
+    # TYPE llama_tokens_predicted counter
+    llama_tokens_predicted 0
+    # HELP llama_eval_time_seconds Total time spent evaluating the prompt
+    # TYPE llama_eval_time_seconds counter
+    llama_eval_time_seconds 0.0
+    # HELP llama_sample_time_seconds Total time spent sampling tokens
+    # TYPE llama_sample_time_seconds counter
+    llama_sample_time_seconds 0.0
+    """
+
+    def fake_get(url, **kwargs):
+        if str(url).endswith("/props"):
+            return _FakeResponse(200, b'{"model": "/models/m.gguf"}', "application/json")
+        if str(url).endswith("/metrics"):
+            return _FakeResponse(200, real_llamacpp_output.encode("ascii"), "text/plain")
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(metrics_module.httpx, "get", fake_get)
+    result = MetricsCollector().read_model_metrics()
+    assert result == {"model": "/models/m.gguf", "prompt_tps": None, "generation_tps": None}
+
+
 def test_read_model_metrics_unreachable_yields_none(monkeypatch) -> None:
     import httpx
 

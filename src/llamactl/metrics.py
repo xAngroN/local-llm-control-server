@@ -56,6 +56,22 @@ def _parse_prometheus(text: str) -> dict[str, float]:
     return result
 
 
+def _rate(samples: dict[str, float], count_name: str, time_name: str) -> float | None:
+    """Compute ``count / time`` from parsed samples, ``None`` when missing.
+
+    llama.cpp metric names vary between versions; anything that is
+    absent or malformed (including a zero denominator) degrades to
+    ``None`` instead of raising, keeping the no-exception contract.
+    """
+    count = samples.get(count_name)
+    time = samples.get(time_name)
+    if not isinstance(count, float) or not isinstance(time, float):
+        return None
+    if time <= 0:
+        return None
+    return count / time
+
+
 def _read_int_file(path: str) -> int | None:
     """Read an integer from a file, returning ``None`` when unreadable."""
     try:
@@ -136,10 +152,8 @@ class MetricsCollector:
             response = httpx.get(self._base_url.rstrip("/") + "/metrics", timeout=_TIMEOUT)
             if response.status_code == 200:
                 samples = _parse_prometheus(response.text)
-                if samples["llama_eval_time"]:
-                    prompt_tps = samples["llama_eval_count"] / samples["llama_eval_time"]
-                if samples["llama_sample_time"]:
-                    generation_tps = samples["llama_sample_count"] / samples["llama_sample_time"]
+                prompt_tps = _rate(samples, "llama_eval_count", "llama_eval_time")
+                generation_tps = _rate(samples, "llama_sample_count", "llama_sample_time")
         except (httpx.HTTPError, ValueError):
             pass
 
