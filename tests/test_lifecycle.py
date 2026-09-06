@@ -203,6 +203,98 @@ def test_stop_running_instance_stops_container(fake_podman) -> None:
     assert mgr._expected_stop is True
 
 
+def test_reload_switches_profile_and_runs_again(fake_podman) -> None:
+    """Reload fast->large->fast each ends with one running container under the new profile."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+
+    status = mgr.reload("large")
+
+    assert status.state is InstanceState.LOADING
+    assert status.profile == "large"
+    entry = fake_podman.containers()[common.container_name]
+    assert entry["status"] == "running"
+    assert status.container_id == entry["id"]
+    assert status.message is None
+    # The new container ran with the large profile's args.
+    args = fake_podman.last_run_args(common.container_name)
+    assert _arg_after(args, "--ctx-size") == EXPECTED_CTX["large"]
+
+    status = mgr.reload("fast")
+
+    assert status.state is InstanceState.LOADING
+    assert status.profile == "fast"
+    entry = fake_podman.containers()[common.container_name]
+    assert entry["status"] == "running"
+    assert status.container_id == entry["id"]
+    assert status.message is None
+    args = fake_podman.last_run_args(common.container_name)
+    assert _arg_after(args, "--ctx-size") == EXPECTED_CTX["fast"]
+    # Only one container has ever been running at a time.
+    assert len(fake_podman.containers()) == 1
+
+
+def test_reload_unknown_profile_leaves_running_instance_untouched(
+    fake_podman,
+) -> None:
+    """A typo in reload must not stop the running instance."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    first = mgr.start("fast")
+    before = tracker.to_dict()
+
+    with pytest.raises(UnknownProfileError, match="nope"):
+        mgr.reload("nope")
+
+    # Container still running, same id, tracker state unchanged.
+    entry = fake_podman.containers()[common.container_name]
+    assert entry["status"] == "running"
+    assert entry["id"] == first.container_id
+    snap = tracker.snapshot()
+    assert snap.state is InstanceState.LOADING
+    assert snap.profile == "fast"
+    assert snap.container_id == first.container_id
+    after = tracker.to_dict()
+    assert after["profile"] == before["profile"]
+    assert after["state"] == before["state"]
+
+
+def test_reload_failed_start_reports_stopped_with_message(fake_podman) -> None:
+    """If the new profile's start fails, the old profile must not be reported."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+    real_start = mgr._podman.start_container
+
+    def boom(args: list[str]) -> str:
+        raise PodmanError(125, "reload start failed", args)
+
+    mgr._podman.start_container = boom  # type: ignore[method-assign]
+    try:
+        with pytest.raises(PodmanError):
+            mgr.reload("large")
+    finally:
+        mgr._podman.start_container = real_start  # type: ignore[method-assign]
+
+    # Stopped with the failure message; the old profile is gone.
+    snap = tracker.snapshot()
+    assert snap.state is InstanceState.STOPPED
+    assert snap.profile is None
+    assert snap.container_id is None
+    assert snap.message is not None
+    assert "reload start failed" in snap.message
+    # No container left running.
+    entry = fake_podman.containers()[common.container_name]
+    assert entry["status"] == "exited"
+
+
 def test_stop_with_nothing_running_is_not_an_error(fake_podman) -> None:
     """Stopping with nothing active returns stopped without raising."""
     common, profiles = load_config(PROFILES_TOML)

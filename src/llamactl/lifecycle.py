@@ -6,7 +6,6 @@ both the tracker state and the real podman container state before
 starting, and the whole flow is guarded by an instance lock so two
 concurrent starts cannot both proceed.
 
-Only ``start`` lives here; stop and reload are separate concerns and
 ``ready`` is only ever set by the later health check, not by this
 module.
 """
@@ -68,41 +67,45 @@ class LifecycleManager:
         re-raised.
         """
         with self._lock:
-            if profile_name not in self._profiles:
-                raise UnknownProfileError(f"unknown profile: {profile_name!r}")
+            return self._start_locked(profile_name)
 
-            status = self._tracker.snapshot()
-            if status.state not in _INACTIVE_STATES:
-                raise AlreadyRunningError(
-                    f"instance already active (state={status.state.value})"
-                )
-            if self._podman.is_running(self._common.container_name):
-                raise AlreadyRunningError(
-                    f"container {self._common.container_name!r} is already running"
-                )
+    def _start_locked(self, profile_name: str) -> InstanceStatus:
+        """Start flow; the caller must already hold :attr:`_lock`."""
+        if profile_name not in self._profiles:
+            raise UnknownProfileError(f"unknown profile: {profile_name!r}")
 
-            # A new start supersedes any previous deliberate stop; clear the
-            # expected-stop flag so this instance's shutdown is judged afresh.
-            self._expected_stop = False
-            self._tracker.transition(InstanceState.STARTING)
-            profile = self._profiles[profile_name]
-            args = render_podman_args(profile, self._common)
-            try:
-                container_id = self._podman.start_container(args)
-            except PodmanError as err:
-                self._tracker.transition(InstanceState.STOPPED)
-                # InstanceTracker.transition(STOPPED) resets instance fields
-                # and ignores extra kwargs, so the failure message is stored
-                # directly (message is not part of the reset set).
-                with self._tracker._lock:
-                    self._tracker._status.message = str(err)
-                raise
-            self._tracker.transition(
-                InstanceState.LOADING,
-                profile=profile_name,
-                container_id=container_id,
+        status = self._tracker.snapshot()
+        if status.state not in _INACTIVE_STATES:
+            raise AlreadyRunningError(
+                f"instance already active (state={status.state.value})"
             )
-            return self._tracker.snapshot()
+        if self._podman.is_running(self._common.container_name):
+            raise AlreadyRunningError(
+                f"container {self._common.container_name!r} is already running"
+            )
+
+        # A new start supersedes any previous deliberate stop; clear the
+        # expected-stop flag so this instance's shutdown is judged afresh.
+        self._expected_stop = False
+        self._tracker.transition(InstanceState.STARTING)
+        profile = self._profiles[profile_name]
+        args = render_podman_args(profile, self._common)
+        try:
+            container_id = self._podman.start_container(args)
+        except PodmanError as err:
+            self._tracker.transition(InstanceState.STOPPED)
+            # InstanceTracker.transition(STOPPED) resets instance fields
+            # and ignores extra kwargs, so the failure message is stored
+            # directly (message is not part of the reset set).
+            with self._tracker._lock:
+                self._tracker._status.message = str(err)
+            raise
+        self._tracker.transition(
+            InstanceState.LOADING,
+            profile=profile_name,
+            container_id=container_id,
+        )
+        return self._tracker.snapshot()
 
     def stop(self) -> InstanceStatus:
         """Stop the current model instance, if any.
@@ -119,15 +122,36 @@ class LifecycleManager:
         :meth:`start` resets it.
         """
         with self._lock:
-            status = self._tracker.snapshot()
-            if status.state is InstanceState.STOPPED and not self._podman.is_running(
-                self._common.container_name
-            ):
-                # Idle stop: nothing to do, no error.
-                self._tracker.transition(InstanceState.STOPPED)
-                return self._tracker.snapshot()
+            return self._stop_locked()
 
-            self._expected_stop = True
-            self._podman.stop_container(self._common.container_name)
+    def _stop_locked(self) -> InstanceStatus:
+        """Stop flow; the caller must already hold :attr:`_lock`."""
+        status = self._tracker.snapshot()
+        if status.state is InstanceState.STOPPED and not self._podman.is_running(
+            self._common.container_name
+        ):
+            # Idle stop: nothing to do, no error.
             self._tracker.transition(InstanceState.STOPPED)
             return self._tracker.snapshot()
+
+        self._expected_stop = True
+        self._podman.stop_container(self._common.container_name)
+        self._tracker.transition(InstanceState.STOPPED)
+        return self._tracker.snapshot()
+
+    def reload(self, profile_name: str) -> InstanceStatus:
+        """Switch the running instance to ``profile_name`` atomically.
+
+        The whole stop-then-start flow runs under the instance lock so no
+        other call can slip in between the two halves. An unknown
+        ``profile_name`` raises :class:`UnknownProfileError` before anything
+        is stopped, so a typo can never kill a running instance. If the
+        start of the new profile fails the tracker ends in ``stopped``
+        with the failure message (the old profile is never reported as
+        active) and the exception is re-raised.
+        """
+        with self._lock:
+            if profile_name not in self._profiles:
+                raise UnknownProfileError(f"unknown profile: {profile_name!r}")
+            self._stop_locked()
+            return self._start_locked(profile_name)
