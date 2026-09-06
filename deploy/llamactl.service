@@ -1,0 +1,14 @@
+[Unit]
+Description=llamactl local LLM control API server
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/llamactl/venv/bin/llamactl serve
+Environment=LLAMACTL_PORT=8081
+Environment=LLAMACTL_PROFILES=%h/.config/llamactl/profiles.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
