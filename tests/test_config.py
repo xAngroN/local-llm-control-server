@@ -165,7 +165,7 @@ class TestLoadConfig:
     def test_bundled_file_loads(self) -> None:
         common, profiles = load_config(BUNDLED_PROFILES)
         assert isinstance(common, CommonConfig)
-        assert set(profiles) == {"fast", "large", "safe"}
+        assert set(profiles) == {"fast", "large", "safe", "shared"}
 
     def test_bundled_common_values(self) -> None:
         common, _ = load_config(BUNDLED_PROFILES)
@@ -177,9 +177,17 @@ class TestLoadConfig:
             assert value in extra
         assert extra[:5] == ("-ngl", "999", "-fa", "on", "--jinja")
 
-    def test_all_profiles_pin_parallel_one(self) -> None:
+    def test_shared_splits_ctx_across_slots(self) -> None:
         _, profiles = load_config(BUNDLED_PROFILES)
-        for name, profile in profiles.items():
+        shared = profiles["shared"]
+        assert shared.ctx_size == 32768
+        assert shared.parallel == 4
+        assert shared.slot_ctx_size == 8192
+
+    def test_ported_profiles_pin_parallel_one(self) -> None:
+        _, profiles = load_config(BUNDLED_PROFILES)
+        for name in ("fast", "large", "safe"):
+            profile = profiles[name]
             assert profile.parallel == 1, name
             # single slot: total context is not split
             assert profile.slot_ctx_size == profile.ctx_size
@@ -198,13 +206,13 @@ class TestLoadConfig:
     def test_env_var_is_respected(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setenv("LLAMACTL_PROFILES", str(BUNDLED_PROFILES))
         common, profiles = load_config()
-        assert set(profiles) == {"fast", "large", "safe"}
+        assert set(profiles) == {"fast", "large", "safe", "shared"}
         assert common == load_config(BUNDLED_PROFILES)[0]
 
     def test_default_path_without_env(self, monkeypatch) -> None:
         monkeypatch.delenv("LLAMACTL_PROFILES", raising=False)
         common, profiles = load_config()
-        assert set(profiles) == {"fast", "large", "safe"}
+        assert set(profiles) == {"fast", "large", "safe", "shared"}
         assert common == load_config(BUNDLED_PROFILES)[0]
 
     def test_unknown_profile_key_raises_value_error(self, tmp_path) -> None:
