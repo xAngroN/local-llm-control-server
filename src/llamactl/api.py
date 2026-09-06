@@ -18,8 +18,9 @@ from llamactl.lifecycle import (
     LifecycleManager,
     UnknownProfileError,
 )
+from llamactl.metrics import MetricsCollector
 from llamactl.podman import Podman, PodmanError
-from llamactl.state import InstanceTracker
+from llamactl.state import InstanceState, InstanceTracker
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             common, profiles, Podman(), InstanceTracker()
         )
     tracker = manager._tracker
+    collector = MetricsCollector()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -103,6 +105,21 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
     def status() -> dict:
         """Return the current instance state (read-only, no podman calls)."""
         return tracker.to_dict()
+
+    @app.get("/metrics")
+    def metrics() -> dict:
+        """Collect VRAM and model-server metrics for the current state.
+
+        In state ``ready`` the model server is queried for throughput and
+        the loaded model; in every other state only the VRAM baseline is
+        reported and the model server is not contacted at all.
+        """
+        status = tracker.snapshot()
+        return collector.collect(
+            status.state if isinstance(status.state, InstanceState)
+            else InstanceState(status.state),
+            status.profile,
+        )
 
     @app.post("/reload")
     def reload(payload: dict = Body(...)) -> dict:
