@@ -9,67 +9,18 @@ immediately -- there is no polling interval to wait for.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 import time
+
+import pytest
 
 from llamactl.events import ContainerEventWatcher
 from llamactl.podman import Podman
 
 DEADLINE_SECONDS = 2.0
 NAME = "watched"
-
-
-class _BlockingStream:
-    """A podman events stream backed by a real, long-lived subprocess.
-
-    Models the real live-container case: the thread is parked in
-    ``next()`` waiting for the next event and can only be woken by the
-    subprocess being terminated (EOF on the blocked ``readline``).  A
-    plain generator cannot be closed from another thread while it is
-    suspended, so ``stop()`` must preempt that block by terminating the
-    subprocess -- exactly what :class:`llamactl.events.ContainerEventWatcher`
-    must do.
-    """
-
-    def __init__(self) -> None:
-        self._proc = subprocess.Popen(["sleep", "30"], stdout=subprocess.PIPE)
-        self.close_calls = 0
-
-    def __iter__(self) -> "_BlockingStream":
-        return self
-
-    def __next__(self) -> dict:
-        # Block on the subprocess's stdout until it is terminated; EOF
-        # (None) then surfaces as StopIteration, like a dead live stream.
-        line = self._proc.stdout.readline()
-        if not line:
-            raise StopIteration
-        return {"Action": "live", "data": line}
-
-    def close(self) -> None:
-        self.close_calls += 1
-        if self._proc.poll() is None:
-            self._proc.terminate()
-        self._proc.wait(timeout=5)
-        self._proc.stdout.close()
-
-
-class _BlockingPodman:
-    """Stand-in for :class:`Podman` whose events stream blocks on read.
-
-    ``events`` is a generator (like :meth:`Podman.events`) so the
-    watcher's Popen lookup (``gi_frame.f_locals``) resolves the
-    subprocess lazily on first ``close``.
-    """
-
-    def __init__(self) -> None:
-        self.stream = _BlockingStream()
-
-    def events(self, filters: list[str]) -> _BlockingStream:
-        proc = self.stream._proc
-        yield  # suspended here until first next(); proc visible in f_locals
-        yield from self.stream
 
 
 def _make_stopped_container(fake_podman) -> None:
@@ -139,36 +90,76 @@ def test_stop_ends_thread_and_no_more_callbacks(fake_podman) -> None:
         assert len(received) == count_before, "callback arrived after stop()"
 
 
-def test_stop_ends_live_stream_subprocess(fake_podman) -> None:
-    """stop() terminates the subprocess of a live stream the thread is
-    blocked on -- the production case of a running container."""
-    podman = _BlockingPodman()
+def test_stop_preempts_thread_blocked_on_live_stream(fake_podman) -> None:
+    """stop() ends a thread blocked reading a live stream, fast.
+
+    Models the production case of a running container: the watcher
+    thread is parked on the next event while the (fake) podman events
+    subprocess stays alive.  ``stop()`` must terminate that subprocess
+    to force an EOF on the blocked read -- it cannot wait for an event
+    to arrive or for a join timeout.  Uses ``threading.Event`` with a
+    timeout, no fixed sleeps on the critical path.
+    """
+    _make_stopped_container(fake_podman)  # exercises fixture wiring
+
+    got = threading.Event()
+    procs: list[subprocess.Popen] = []
+
+    class _LiveStream(Podman):
+        """Podman whose events stream stays alive and never emits.
+
+        Uses the new optional ``handle`` parameter: it records the
+        subprocess so the test can assert ``stop()`` terminated it.
+        """
+
+        def events(self, filters, handle=None):
+            cmd = [self.binary, "events", "--format", "json", *filters]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+            )
+            if handle is not None:
+                handle(proc)
+            procs.append(proc)
+            got.set()
+            try:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+            finally:
+                pass  # process cleanup is the watcher's job via the handle
+
+    podman = _LiveStream()
     received: list[dict] = []
     watcher = ContainerEventWatcher(podman, NAME, received.append)  # type: ignore[arg-type]
     watcher.start()
     thread = watcher._thread
     assert thread is not None
     assert thread.daemon
-    assert thread.is_alive()
-
-    # Give the thread a moment to reach the blocked first read.
-    time.sleep(0.3)
-    assert thread.is_alive(), "thread should be parked reading the live stream"
+    assert got.wait(DEADLINE_SECONDS), "events stream subprocess never started"
+    # The thread is now parked on the blocked read.
 
     t0 = time.monotonic()
     watcher.stop()
     elapsed = time.monotonic() - t0
 
-    # The blocked read must have been preempted quickly, not left to the
-    # 10s join timeout, and the subprocess must actually be terminated.
     assert not thread.is_alive(), "watcher thread still alive after stop()"
     assert elapsed < DEADLINE_SECONDS, (
         f"stop() took {elapsed:.2f}s to end a thread blocked on read"
     )
-    assert podman.stream._proc.poll() is not None, (
-        "podman events subprocess survived stop()"
-    )
     assert received == [], "no callback should arrive while reading is blocked"
+    assert procs, "events() never reported its subprocess via the handle"
+    deadline = time.monotonic() + DEADLINE_SECONDS
+    while time.monotonic() < deadline:
+        if all(p.poll() is not None for p in procs):
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("podman events subprocess survived stop()")
 
 
 def test_callback_exception_does_not_kill_watcher(fake_podman, monkeypatch) -> None:

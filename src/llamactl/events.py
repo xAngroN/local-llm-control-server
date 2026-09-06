@@ -12,11 +12,12 @@ raised by the callback are logged and never kill the watcher thread.
 
 ``stop()`` must be able to end the watcher even while the thread is
 blocked waiting for the next event from a *live* stream -- the normal
-case for a running container.  A plain generator cannot be ``close()``d
-from another thread while it is suspended on a read, so the watcher
-wraps the stream in :class:`StreamHandle`, which terminates the
-subprocess the stream was built from: killing that process forces an
-EOF on the blocked ``readline`` so the thread wakes and exits promptly.
+case for a running container.  A plain generator cannot be woken from
+another thread while it is suspended on a read, so the watcher holds a
+handle to the subprocess the stream was built from (see
+:meth:`Podman.events` ``handle`` parameter) and terminates it on
+``stop()``: killing that process forces an EOF on the blocked
+``readline`` so the thread wakes and exits promptly.
 """
 
 from __future__ import annotations
@@ -41,15 +42,13 @@ STOP_JOIN_TIMEOUT_SECONDS = 10.0
 class StreamHandle:
     """Wraps a podman events stream so ``stop()`` can end the subprocess.
 
-    The underlying :class:`Podman.events` generator does not expose its
-    ``Popen`` object, and a generator cannot be closed from another
-    thread while it is suspended on a read.  This handle therefore
-    terminates the subprocess the stream was built from directly, which
-    is what actually unblocks a thread parked in ``readline``.  A plain
-    stream without a subprocess is only closed, which is enough to let
-    an in-memory iterator run its ``finally`` block.  ``close()`` is
-    idempotent and safe to call from the watcher thread's ``finally``
-    block as well as from ``stop()``.
+    The underlying :class:`Podman.events` generator exposes its
+    ``Popen`` through an optional handle parameter; this wrapper keeps
+    both the stream and that process so the watcher can terminate the
+    process from ``stop()``.  A plain stream without a subprocess is
+    only closed, which lets an in-memory iterator run its ``finally``
+    block.  ``close()`` is idempotent and safe to call from the
+    watcher thread's ``finally`` block as well as from ``stop()``.
     """
 
     def __init__(
@@ -116,10 +115,6 @@ class ContainerEventWatcher:
         # the thread and stop() always agree on which stream is live.
         self._current_stream: StreamHandle | None = None
         self._stream_lock = threading.Lock()
-        # The Popen spawned for the current stream, set on the same
-        # iteration boundary as the handle so stop() can terminate it.
-        self._current_proc: subprocess.Popen | None = None
-        self._proc_lock = threading.Lock()
 
     def _filters(self) -> list[str]:
         return [
@@ -129,23 +124,33 @@ class ContainerEventWatcher:
             "--filter", "event=start",
         ]
 
-    def _take_stream(self, handle: StreamHandle | None, proc: subprocess.Popen | None) -> None:
+    def _open_stream(self) -> StreamHandle:
+        """Start a podman event stream and capture its subprocess handle."""
+        handle = StreamHandle(self.podman.events(self._filters()))
+        handle_box: list[subprocess.Popen | None] = [None]
+        events = self.podman.events
+        # ``Podman.events`` accepts an optional ``handle`` callback that
+        # receives the Popen once the subprocess is started; use it when
+        # available so stop() can terminate the process directly.
+        if _events_takes_handle(events):
+            stream = self.podman.events(self._filters(), handle=handle_box.append)
+            handle._stream = stream
+            handle._proc = handle_box[0]
+            return handle
+        return handle
+
+    def _take_stream(self, handle: StreamHandle | None) -> None:
         """Record the stream owned by the thread so stop() can end it."""
         with self._stream_lock:
             self._current_stream = handle
-        with self._proc_lock:
-            self._current_proc = proc
 
-    def _drop_stream(self, handle: StreamHandle | None, proc: subprocess.Popen | None) -> None:
+    def _drop_stream(self, handle: StreamHandle | None) -> None:
         """Clear the current-stream slot if it still points at this handle."""
         if handle is None:
             return
         with self._stream_lock:
             if self._current_stream is handle:
                 self._current_stream = None
-        with self._proc_lock:
-            if self._current_proc is proc:
-                self._current_proc = None
 
     def start(self) -> None:
         """Start the watcher daemon thread; returns immediately."""
@@ -172,18 +177,11 @@ class ContainerEventWatcher:
         with self._stream_lock:
             handle = self._current_stream
             self._current_stream = None
-        with self._proc_lock:
-            proc = self._current_proc
-            self._current_proc = None
         if handle is not None:
             try:
                 handle.close()
             except Exception:
                 pass
-        # The thread may have already closed the stream on its own path
-        # (e.g. the stream broke); make sure the subprocess is gone.
-        if proc is not None:
-            StreamHandle._terminate(proc)
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=STOP_JOIN_TIMEOUT_SECONDS)
@@ -192,11 +190,9 @@ class ContainerEventWatcher:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             handle: StreamHandle | None = None
-            proc: subprocess.Popen | None = None
             try:
-                stream = self.podman.events(self._filters())
-                handle = StreamHandle(stream, proc)
-                self._take_stream(handle, proc)
+                handle = self._open_stream()
+                self._take_stream(handle)
                 for event in handle:
                     if self._stop_event.is_set():
                         break
@@ -219,8 +215,22 @@ class ContainerEventWatcher:
                         handle.close()
                     except Exception:
                         pass
-                self._drop_stream(handle, proc)
+                self._drop_stream(handle)
             if self._stop_event.is_set():
                 break
             # Wait out the restart delay in one slice; stop() wakes it.
             self._stop_event.wait(RESTART_DELAY_SECONDS)
+
+
+def _events_takes_handle(events: object) -> bool:
+    """Whether ``events()`` accepts the optional ``handle`` keyword."""
+    import inspect
+
+    try:
+        signature = inspect.signature(events)
+    except (TypeError, ValueError):
+        return False
+    params = signature.parameters
+    return "handle" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )

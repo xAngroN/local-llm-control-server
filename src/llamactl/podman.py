@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 
 class PodmanError(RuntimeError):
@@ -105,11 +105,21 @@ class Podman:
             return []
         return out.splitlines() if out else []
 
-    def events(self, filters: list[str]) -> Iterator[dict]:
+    def events(
+        self,
+        filters: list[str],
+        handle: Callable[[subprocess.Popen], None] | None = None,
+    ) -> Iterator[dict]:
         """Stream podman events as parsed JSON objects (line by line).
 
         The subprocess is started lazily on first iteration, so importing
         this module (or constructing :class:`Podman`) never blocks.
+
+        ``handle`` is an optional callback invoked with the
+        :class:`subprocess.Popen` as soon as the subprocess is started,
+        letting a caller (e.g. the event watcher) terminate the process
+        from another thread to unblock a reader parked on the stream.
+        Existing callers may keep using ``p.events([...])`` unchanged.
         """
         cmd = [self.binary, "events", "--format", "json", *filters]
         proc = subprocess.Popen(
@@ -120,6 +130,8 @@ class Podman:
         )
         assert proc.stdout is not None
         try:
+            if handle is not None:
+                handle(proc)
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
