@@ -205,3 +205,61 @@ def test_create_app_without_manager_builds_from_config(fake_podman) -> None:
         assert client.get("/healthz").status_code == 200
         body = client.get("/profiles").json()
         assert set(body) == ALL_PROFILES
+
+
+def _suspend_client(fake_podman, monkeypatch) -> TestClient:
+    """Client whose POST /suspend uses a stubbed power.suspend()."""
+    import llamactl.api as api_module
+
+    monkeypatch.setattr(api_module, "suspend", lambda **kw: None)
+    return make_client(fake_podman)
+
+
+def test_suspend_with_running_instance_does_not_stop_container(
+    fake_podman, monkeypatch
+) -> None:
+    """POST /suspend freezes, never stops: state and container untouched."""
+    client = _suspend_client(fake_podman, monkeypatch)
+    started = client.post("/start", json={"profile": "fast"}).json()
+
+    stop_calls = {"n": 0}
+    real_manager = client.app.state.manager
+
+    def spy_stop():
+        stop_calls["n"] += 1
+        return real_manager.stop()
+
+    real_manager.stop = spy_stop  # type: ignore[method-assign]
+
+    response = client.post("/suspend")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["suspend_requested"] is True
+    # Instance state is unchanged: still loading, same container, same profile.
+    assert body["state"] == "loading"
+    assert body["profile"] == "fast"
+    assert body["container_id"] == started["container_id"]
+    # The container keeps running: nothing stopped it.
+    common, _ = load_config(PROFILES_TOML)
+    entry = fake_podman.containers()[common.container_name]
+    assert entry["status"] == "running"
+    assert stop_calls["n"] == 0
+    # And the tracker still reports the same state.
+    assert client.get("/status").json()["state"] == "loading"
+
+
+def test_suspend_idle_returns_200(fake_podman, monkeypatch) -> None:
+    """POST /suspend with no running instance also returns 200."""
+    import llamactl.api as api_module
+
+    client = make_client(fake_podman)
+    original = api_module.suspend
+    api_module.suspend = lambda **kw: None  # type: ignore[assignment]
+    try:
+        response = client.post("/suspend")
+    finally:
+        api_module.suspend = original
+    assert response.status_code == 200
+    body = response.json()
+    assert body["suspend_requested"] is True
+    assert body["state"] == "stopped"
