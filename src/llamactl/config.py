@@ -4,7 +4,10 @@ Arguments are always produced as flat lists of strings (never as a composed
 shell string) so they can be passed to ``subprocess`` without ``shell=True``.
 """
 
+import os
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -106,3 +109,74 @@ def render_podman_args(profile: Profile, common: CommonConfig) -> list[str]:
     ]
     args.extend(render_server_args(profile, common))
     return args
+
+
+#: Keys of a ``[profiles.<name>]`` table that are consumed by the schema.
+_PROFILE_KEYS = {
+    "model",
+    "ctx_size",
+    "kv_cache_type_k",
+    "kv_cache_type_v",
+    "parallel",
+    "batch_size",
+    "extra_args",
+}
+
+
+def _default_profiles_path() -> Path:
+    """Resolve ``config/profiles.toml`` relative to the repo root."""
+    package_root = Path(__file__).resolve().parent.parent.parent
+    return package_root / "config" / "profiles.toml"
+
+
+def load_config(path: Path | None = None) -> tuple[CommonConfig, dict[str, Profile]]:
+    """Load the profile file and return ``(common, profiles)``.
+
+    The file path is resolved in this order:
+
+    1. ``path`` if given.
+    2. the ``LLAMACTL_PROFILES`` environment variable.
+    3. ``config/profiles.toml`` relative to the repository root.
+
+    Unknown keys inside a ``[profiles.<name>]`` table raise
+    :class:`ValueError` naming the offending key.
+    """
+    if path is None:
+        env = os.environ.get("LLAMACTL_PROFILES")
+        path = Path(env) if env else _default_profiles_path()
+    with path.open("rb") as fh:
+        data = tomllib.load(fh)
+    if "common" not in data:
+        raise ValueError(f"missing [common] table in {path}")
+    common = _build_common(data["common"])
+    profiles: dict[str, Profile] = {}
+    for name, table in data.get("profiles", {}).items():
+        profiles[name] = _build_profile(name, table, common.image)
+    return common, profiles
+
+
+def _build_common(table: dict) -> CommonConfig:
+    return CommonConfig(
+        image=table["image"],
+        models_dir=table["models_dir"],
+        container_name=table["container_name"],
+        host_port=int(table["host_port"]),
+        extra_args=tuple(table.get("extra_args", ())),
+    )
+
+
+def _build_profile(name: str, table: dict, default_image: str) -> Profile:
+    for key in table:
+        if key not in _PROFILE_KEYS:
+            raise ValueError(f"unknown key {key!r} in profile {name!r}")
+    return Profile(
+        name=name,
+        model=table["model"],
+        image=table.get("image", default_image),
+        ctx_size=int(table["ctx_size"]),
+        kv_cache_type_k=table["kv_cache_type_k"],
+        kv_cache_type_v=table["kv_cache_type_v"],
+        parallel=int(table["parallel"]),
+        batch_size=int(table["batch_size"]),
+        extra_args=tuple(table.get("extra_args", ())),
+    )

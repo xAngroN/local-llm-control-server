@@ -1,8 +1,19 @@
 """Tests for llamactl.config profile schema and podman argument rendering."""
 
+from pathlib import Path
+
 import pytest
 
-from llamactl.config import CommonConfig, Profile, render_podman_args, render_server_args
+from llamactl.config import (
+    CommonConfig,
+    Profile,
+    load_config,
+    render_podman_args,
+    render_server_args,
+)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BUNDLED_PROFILES = REPO_ROOT / "config" / "profiles.toml"
 
 
 def _profile(**kwargs) -> Profile:
@@ -148,3 +159,70 @@ class TestRenderPodmanArgs:
         assert args[0] == "run"
         assert "--name" in args[: image_idx]
         assert "--publish" in args[: image_idx]
+
+
+class TestLoadConfig:
+    def test_bundled_file_loads(self) -> None:
+        common, profiles = load_config(BUNDLED_PROFILES)
+        assert isinstance(common, CommonConfig)
+        assert set(profiles) == {"fast", "large", "safe"}
+
+    def test_bundled_common_values(self) -> None:
+        common, _ = load_config(BUNDLED_PROFILES)
+        assert common.models_dir == "/var/home/bazzite/models"
+        assert common.container_name == "llamactl-model"
+        assert common.host_port == 8080
+        extra = tuple(common.extra_args)
+        for value in ("-ngl", "999", "-fa", "on", "--jinja"):
+            assert value in extra
+        assert extra[:5] == ("-ngl", "999", "-fa", "on", "--jinja")
+
+    def test_all_profiles_pin_parallel_one(self) -> None:
+        _, profiles = load_config(BUNDLED_PROFILES)
+        for name, profile in profiles.items():
+            assert profile.parallel == 1, name
+            # single slot: total context is not split
+            assert profile.slot_ctx_size == profile.ctx_size
+
+    def test_render_podman_args_for_each_profile(self) -> None:
+        common, profiles = load_config(BUNDLED_PROFILES)
+        for name, profile in profiles.items():
+            args = render_podman_args(profile, common)
+            assert args[0] == "run"
+            assert all(isinstance(a, str) for a in args)
+            assert profile.image in args
+            # common extra flags are applied for every profile
+            assert "--jinja" in args
+            assert "-ngl" in args and args[args.index("-ngl") + 1] == "999"
+
+    def test_env_var_is_respected(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("LLAMACTL_PROFILES", str(BUNDLED_PROFILES))
+        common, profiles = load_config()
+        assert set(profiles) == {"fast", "large", "safe"}
+        assert common == load_config(BUNDLED_PROFILES)[0]
+
+    def test_default_path_without_env(self, monkeypatch) -> None:
+        monkeypatch.delenv("LLAMACTL_PROFILES", raising=False)
+        common, profiles = load_config()
+        assert set(profiles) == {"fast", "large", "safe"}
+        assert common == load_config(BUNDLED_PROFILES)[0]
+
+    def test_unknown_profile_key_raises_value_error(self, tmp_path) -> None:
+        file = tmp_path / "profiles.toml"
+        file.write_text(
+            "[common]\n"
+            "image = \"img\"\n"
+            "models_dir = \"/m\"\n"
+            "container_name = \"c\"\n"
+            "host_port = 8080\n"
+            "[profiles.fast]\n"
+            "model = \"m.gguf\"\n"
+            "ctx_size = 1024\n"
+            "kv_cache_type_k = \"f16\"\n"
+            "kv_cache_type_v = \"f16\"\n"
+            "parallel = 1\n"
+            "batch_size = 128\n"
+            "bogus_key = 1\n"
+        )
+        with pytest.raises(ValueError, match="bogus_key"):
+            load_config(file)
