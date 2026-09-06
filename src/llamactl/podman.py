@@ -31,7 +31,11 @@ class PodmanError(RuntimeError):
 class Podman:
     """Thin wrapper around the podman CLI."""
 
-    def __init__(self, binary: str = os.environ.get("LLAMACTL_PODMAN", "podman")) -> None:
+    def __init__(self, binary: str | None = None) -> None:
+        # Resolve the binary at construction time, not import time, so the
+        # LLAMACTL_PODMAN override stays effective for later lifecycle tests.
+        if binary is None:
+            binary = os.environ.get("LLAMACTL_PODMAN", "podman")
         self.binary = binary
 
     def run(self, args: list[str], timeout: float | None = None) -> str:

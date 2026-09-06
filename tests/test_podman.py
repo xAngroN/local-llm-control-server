@@ -75,6 +75,17 @@ def test_default_binary_without_env(monkeypatch) -> None:
     assert p.binary == "podman"
 
 
+def test_env_var_resolved_at_construction_time(tmp_path, monkeypatch) -> None:
+    """LLAMACTL_PODMAN set after import must still be honored at construction."""
+    path = tmp_path / "late-podman"
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    # Set the env var only AFTER the module was imported (test module
+    # imported llamactl.podman at the top), proving it is read per-construction.
+    monkeypatch.setenv("LLAMACTL_PODMAN", str(path))
+    assert Podman().binary == str(path)
+
+
 def test_run_success(fake_podman) -> None:
     p = Podman(binary=fake_podman)
     out = p.run(["run"])
