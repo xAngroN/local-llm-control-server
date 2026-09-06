@@ -172,3 +172,47 @@ def test_already_running_container_detected_via_podman(
     entry = fake_podman.containers()[common.container_name]
     assert entry["status"] == "running"
     assert tracker.snapshot().state is InstanceState.STOPPED
+
+
+def test_stop_running_instance_stops_container(fake_podman) -> None:
+    """Stopping a running instance ends the container and resets the tracker."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    mgr.start("fast")
+    entry = fake_podman.containers()[common.container_name]
+    assert entry["status"] == "running"
+
+    status = mgr.stop()
+
+    # The fake podman marks the container exited with code 0.
+    entry = fake_podman.containers()[common.container_name]
+    assert entry["status"] == "exited"
+    assert entry["exit_code"] == 0
+
+    # Tracker ends in stopped with profile reset.
+    assert status.state is InstanceState.STOPPED
+    assert status.profile is None
+    assert status.container_id is None
+    snap = tracker.snapshot()
+    assert snap.state is InstanceState.STOPPED
+    assert snap.profile is None
+
+    # The shutdown is flagged as self-initiated for crash detection.
+    assert mgr._expected_stop is True
+
+
+def test_stop_with_nothing_running_is_not_an_error(fake_podman) -> None:
+    """Stopping with nothing active returns stopped without raising."""
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    mgr = LifecycleManager(common, profiles, Podman(), tracker)
+
+    # No start ever happened; tracker is stopped and no container exists.
+    status = mgr.stop()
+
+    assert status.state is InstanceState.STOPPED
+    assert status.profile is None
+    assert fake_podman.containers() == {}
+    assert tracker.snapshot().state is InstanceState.STOPPED

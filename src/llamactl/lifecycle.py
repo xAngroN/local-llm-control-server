@@ -47,6 +47,10 @@ class LifecycleManager:
         self._podman = podman
         self._tracker = tracker
         self._lock = threading.Lock()
+        # Marks the most recent shutdown as self-initiated.  Crash
+        # detection later reads this flag so a deliberate stop is not
+        # reported as a crash; the next :meth:`start` clears it.
+        self._expected_stop = False
 
     def list_profiles(self) -> list[str]:
         """Return the names of all configured profiles."""
@@ -77,6 +81,9 @@ class LifecycleManager:
                     f"container {self._common.container_name!r} is already running"
                 )
 
+            # A new start supersedes any previous deliberate stop; clear the
+            # expected-stop flag so this instance's shutdown is judged afresh.
+            self._expected_stop = False
             self._tracker.transition(InstanceState.STARTING)
             profile = self._profiles[profile_name]
             args = render_podman_args(profile, self._common)
@@ -95,4 +102,32 @@ class LifecycleManager:
                 profile=profile_name,
                 container_id=container_id,
             )
+            return self._tracker.snapshot()
+
+    def stop(self) -> InstanceStatus:
+        """Stop the current model instance, if any.
+
+        A stop with nothing active (tracker ``stopped`` and no running
+        container) is not an error and simply returns the ``stopped``
+        state.  Otherwise the container is stopped (``podman stop`` also
+        removes it because it was started with ``--rm``) and the tracker
+        ends in ``stopped`` with ``profile`` reset to ``None``.
+
+        Before touching the container, ``self._expected_stop`` is set so
+        crash detection later recognises this shutdown as intentional.
+        The flag is intentionally left in place until the next
+        :meth:`start` resets it.
+        """
+        with self._lock:
+            status = self._tracker.snapshot()
+            if status.state is InstanceState.STOPPED and not self._podman.is_running(
+                self._common.container_name
+            ):
+                # Idle stop: nothing to do, no error.
+                self._tracker.transition(InstanceState.STOPPED)
+                return self._tracker.snapshot()
+
+            self._expected_stop = True
+            self._podman.stop_container(self._common.container_name)
+            self._tracker.transition(InstanceState.STOPPED)
             return self._tracker.snapshot()
