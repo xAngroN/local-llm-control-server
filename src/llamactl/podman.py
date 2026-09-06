@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 
 class PodmanError(RuntimeError):
@@ -105,13 +105,57 @@ class Podman:
             return []
         return out.splitlines() if out else []
 
-    def events(self, filters: list[str]) -> Iterator[dict]:
+    def events(
+        self,
+        filters: list[str],
+        handle: Callable[[subprocess.Popen], None] | None = None,
+    ) -> Iterator[dict]:
         """Stream podman events as parsed JSON objects (line by line).
 
-        The subprocess is started lazily on first iteration, so importing
-        this module (or constructing :class:`Podman`) never blocks.
+        The subprocess is started lazily on the first iteration, so
+        importing this module (or constructing :class:`Podman`) never
+        blocks.
+
+        The returned :class:`EventStream` exposes the running subprocess
+        as ``stream.process`` once iteration has begun.  A caller (e.g.
+        the container event watcher) can terminate that process from
+        another thread to unblock a reader parked on a live stream: the
+        forced EOF ends the blocked ``readline`` immediately, which
+        closing the stream cannot do.
+
+        ``handle`` is an optional callback invoked with the
+        :class:`subprocess.Popen` as soon as the subprocess is started.
+        Existing callers may keep using ``p.events([...])`` unchanged.
         """
-        cmd = [self.binary, "events", "--format", "json", *filters]
+        return EventStream(self, filters, handle)
+
+
+class EventStream:
+    """A lazy, iterable podman event stream with direct subprocess access.
+
+    Returned by :meth:`Podman.events`.  The ``Popen`` is started on the
+    first ``next()`` and is then available as :attr:`process`, so a
+    caller can terminate the process from another thread to unblock a
+    reader parked on a live stream (closing the stream alone cannot wake
+    a blocking read).  Iteration and ``terminate()`` are both safe to
+    use concurrently: ``terminate()`` just ends the subprocess, which
+    forces an EOF on the reader and makes the iteration raise/stop,
+    after which the stream's own cleanup is a no-op (idempotent).
+    """
+
+    def __init__(
+        self,
+        podman: Podman,
+        filters: list[str],
+        handle: Callable[[subprocess.Popen], None] | None = None,
+    ) -> None:
+        self._podman = podman
+        self._filters = list(filters)
+        self._handle = handle
+        self.process: subprocess.Popen | None = None
+
+    def _start(self) -> subprocess.Popen:
+        cmd = [self._podman.binary, "events", "--format", "json", *self._filters]
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -119,19 +163,62 @@ class Podman:
             text=True,
         )
         assert proc.stdout is not None
+        self.process = proc
+        if self._handle is not None:
+            self._handle(proc)
+        return proc
+
+    def __iter__(self) -> "EventStream":
+        return self
+
+    def __next__(self) -> dict:
+        if self.process is None:
+            proc = self._start()
+        else:
+            proc = self.process
+        assert proc.stdout is not None
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                # EOF: the subprocess ended (or was terminated).
+                # Wait for it so the OS reaps the process and the pipe
+                # resources are released -- the same implicit cleanup the
+                # pre-EventStream generator relied on (via GC / close).
+                proc.wait()
+                raise StopIteration
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+    def close(self) -> None:
+        """Close the stream: terminate the subprocess and release resources.
+
+        Safe to call from the consuming thread (e.g. in a ``finally``
+        block) or from another thread.  Idempotent -- calling it after
+        the stream has already exhausted or been terminated is a no-op.
+        """
+        self.terminate()
+
+    def terminate(self) -> None:
+        """End the underlying subprocess (no-op if not started or done).
+
+        Safe to call from another thread while a reader is blocked in
+        :meth:`__next__`: terminating the process closes its stdout pipe
+        so the blocked read returns EOF immediately.  Idempotent.
+        """
+        proc = self.process
+        if proc is None:
+            return
         try:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-        finally:
             if proc.poll() is None:
                 proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
