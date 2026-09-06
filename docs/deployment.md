@@ -90,3 +90,32 @@ curl -s localhost:8081/healthz
 
 Beide Befehle müssen erneut erfolgreich sein: `active (running)` und
 `"status":"ok"`.
+
+## 8. Start ohne Anmeldung (Linger)
+
+Ohne Linger startet systemd Benutzerdienste erst, wenn sich der Benutzer
+zum ersten Mal anmeldet. Nach einem Neustart wäre der Rechner also per
+Wake-on-LAN zwar weckbar, der `llamactl`-Dienst würde aber nicht laufen —
+Fernsteuerung wäre unmöglich. Linger stellt sicher, dass die
+Benutzerdienste ab dem Systemstart laufen, ohne dass sich jemand anmelden
+muss. Dieser Schritt ist daher keine Option, sondern Voraussetzung für den
+reinen Wake-on-LAN-Betrieb.
+
+Aktivieren:
+
+```sh
+loginctl enable-linger <benutzer>
+```
+
+Prüfung:
+
+1. `loginctl show-user <benutzer> --property=Linger` muss `Linger=yes`
+   liefern.
+2. Rechner neu starten und **ohne vorherige Anmeldung** (nur per
+   Fernzugriff, z. B. SSH nach Weckung) prüfen, dass
+   `systemctl --user status llamactl` `active (running)` meldet und
+   `curl -s localhost:8081/healthz` antwortet.
+
+Für die automatische Prüfung dieser drei Bedingungen siehe
+[`scripts/verify-boot-readiness.sh`](../scripts/verify-boot-readiness.sh),
+das sie nacheinander ausführt und je Prüfung `OK` bzw. `FEHLER` ausgibt.
