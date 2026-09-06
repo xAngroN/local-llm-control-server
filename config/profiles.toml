@@ -9,7 +9,8 @@ image = "docker.io/ggml-org/llama.cpp:server-vulkan"
 models_dir = "/var/home/bazzite/models"
 container_name = "llamactl-model"
 host_port = 8080
-extra_args = ["-ngl", "999", "-fa", "on", "--jinja", "--draft-max", "4", "--draft", "0"]
+# --metrics: der API-Server wertet die Prometheus-Zähler des Modell-Servers aus
+extra_args = ["-ngl", "999", "-fa", "on", "--jinja", "--draft-max", "4", "--draft", "0", "--metrics"]
 
 [profiles.fast]
 model = "fast.gguf"
