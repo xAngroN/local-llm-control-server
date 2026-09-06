@@ -35,24 +35,10 @@ _ACTIVE_STATES = (
     InstanceState.DEGRADED,
 )
 
-#: States from which a probe is issued at all. ``starting`` is still
-#: booting; ``stopped``/``crashed``/``suspended`` mean there is no live
-#: process to poll, so we skip and leave the state untouched.
-_PROBE_STATES = (
-    InstanceState.STARTING,
-    InstanceState.LOADING,
-    InstanceState.READY,
-    InstanceState.DEGRADED,
-)
-
-#: States that a healthy probe promotes to ``ready``. ``starting`` is left
-#: alone -- the server is not yet expected to answer, so a 200 there is not
-#: yet a signal to call it ready.
-_READY_SETTLE_STATES = (
-    InstanceState.LOADING,
-    InstanceState.READY,
-    InstanceState.DEGRADED,
-)
+#: States from which a probe is issued at all. ``stopped``/``crashed``/
+#: ``suspended`` mean there is no live process to poll, so we skip and
+#: leave the state untouched.
+_PROBE_STATES = _ACTIVE_STATES
 
 #: States from which a run of failures demotes to ``degraded``. ``degraded``
 #: is already demoted, so failures there only keep it degraded (the streak
@@ -122,8 +108,9 @@ class HealthPoller:
         """Issue a single health probe and update the tracker.
 
         Returns ``True`` when the server answered with HTTP 200, ``False``
-        otherwise. When the tracker is ``stopped``, ``crashed`` or
-        ``suspended`` no HTTP request is issued and nothing is set.
+        otherwise. When the tracker is ``stopped``, ``crashed``,
+        ``suspended`` or ``starting`` no HTTP request is issued and nothing
+        is set.
         """
         status = self._tracker.snapshot()
         state = status.state
@@ -133,8 +120,8 @@ class HealthPoller:
         ok = self._probe()
         if ok:
             self._consecutive_failures = 0
-            if state in _READY_SETTLE_STATES:
-                self._tracker.transition(InstanceState.READY)
+            # Every state we probe is one a healthy 200 promotes to ready.
+            self._tracker.transition(InstanceState.READY)
             return True
 
         self._consecutive_failures += 1
