@@ -77,6 +77,16 @@ def test_start_creates_running_container_with_profile_args(
     assert _arg_after(args, "--ctx-size") == EXPECTED_CTX[name]
     assert _arg_after(args, "--parallel") == EXPECTED_PARALLEL[name]
     assert _arg_after(args, "--label") == f"{PROFILE_LABEL}={name}"
+    # The --label flag must precede the image and every server argument
+    # (it is invalid to a real ``podman run`` after the image/command
+    # arguments), i.e. it belongs in the podman-run flag section.
+    idx_label = args.index("--label")
+    idx_model = args.index("--model")
+    idx_volume_val = args.index(args[args.index("--volume") + 1])
+    idx_image = args.index(profiles[name].image)
+    assert idx_volume_val < idx_label < idx_image < idx_model
+    # The image immediately follows the label value.
+    assert args[idx_label + 2] == profiles[name].image
 
 
 def test_unknown_profile_raises_without_podman_or_tracker_touch(

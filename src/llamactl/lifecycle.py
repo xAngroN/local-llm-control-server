@@ -94,8 +94,14 @@ class LifecycleManager:
         profile = self._profiles[profile_name]
         args = render_podman_args(profile, self._common)
         # Tag the container with its profile so a restarted manager can
-        # recover the active profile name via ``reconcile``.
-        args.extend(["--label", f"{PROFILE_LABEL}={profile_name}"])
+        # recover the active profile name via ``reconcile``.  The flag
+        # goes into the podman-run flag section, before the image and
+        # server arguments, exactly where real ``podman run`` expects it.
+        image_index = args.index(profile.image)
+        args[image_index:image_index] = [
+            "--label",
+            f"{PROFILE_LABEL}={profile_name}",
+        ]
         try:
             container_id = self._podman.start_container(args)
         except PodmanError as err:
