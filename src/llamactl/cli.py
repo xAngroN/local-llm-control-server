@@ -3,8 +3,6 @@
 import os
 import sys
 
-from llamactl.api import app
-
 DEFAULT_BIND = "0.0.0.0"
 DEFAULT_PORT = "8081"
 
@@ -30,7 +28,11 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
+    from llamactl.api import create_app
+
     bind = os.environ.get("LLAMACTL_BIND", DEFAULT_BIND)
     port = int(os.environ.get("LLAMACTL_PORT", DEFAULT_PORT))
-    uvicorn.run(app, host=bind, port=port)
+    # Pass the application object (not a dotted path) so uvicorn reuses
+    # the lifespan-built manager and does not re-import the module.
+    uvicorn.run(create_app(), host=bind, port=port)
     return 0
