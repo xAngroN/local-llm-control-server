@@ -9,7 +9,7 @@ from llamactl.api import create_app
 from llamactl.config import load_config
 from llamactl.lifecycle import LifecycleManager
 from llamactl.podman import Podman, PodmanError
-from llamactl.state import InstanceTracker
+from llamactl.state import InstanceState, InstanceTracker
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROFILES_TOML = REPO_ROOT / "config" / "profiles.toml"
@@ -126,6 +126,41 @@ def test_reload_unknown_profile_returns_404_and_keeps_instance(fake_podman) -> N
     entry = fake_podman.containers()[common.container_name]
     assert entry["status"] == "running"
     assert entry["id"] == started["container_id"]
+
+
+def test_status_idle_reports_stopped_with_expected_fields(fake_podman) -> None:
+    client = make_client(fake_podman)
+    response = client.get("/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "stopped"
+    assert body["profile"] is None
+    assert body["since"]
+
+
+def test_status_after_start_reports_active_state_and_profile(fake_podman) -> None:
+    client = make_client(fake_podman)
+    assert client.post("/start", json={"profile": "fast"}).status_code == 200
+    response = client.get("/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "loading"
+    assert body["profile"] == "fast"
+    assert body["container_id"] is not None
+    assert body["since"]
+
+
+def test_status_reports_every_state_as_lowercase_string(fake_podman) -> None:
+    # Build with a known tracker so we can set states directly.
+    common, profiles = load_config(PROFILES_TOML)
+    tracker = InstanceTracker()
+    manager = LifecycleManager(common, profiles, Podman(), tracker)
+    with TestClient(create_app(manager)) as c:
+        for state in InstanceState:
+            tracker.transition(state, profile="fast")
+            response = c.get("/status")
+            assert response.status_code == 200
+            assert response.json()["state"] == state.value
 
 
 def test_podman_error_maps_to_500_with_message(fake_podman) -> None:
