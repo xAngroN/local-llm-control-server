@@ -133,7 +133,7 @@ class MetricsCollector:
         Returns ``{"model", "prompt_tps", "generation_tps"}`` extracted
         from the answers. The throughput values are the tokens/second
         counters llama.cpp already publishes in its Prometheus output
-        (``llama_prompt_tokens_per_second`` / ``llama_tokens_predicted_per_second``),
+        (``llamacpp:prompt_tokens_seconds`` / ``llamacpp:predicted_tokens_seconds``),
         not a rate computed here. Any transport failure (connection
         refused, timeout, HTTP error) yields ``None`` for every field
         instead of an exception.
@@ -147,7 +147,9 @@ class MetricsCollector:
             if response.status_code == 200:
                 props = response.json()
                 if isinstance(props, dict):
-                    candidate = props.get("model")
+                    # Real llama.cpp /props has no top-level "model" key --
+                    # the loaded model path is under "model_path".
+                    candidate = props.get("model_path")
                     if isinstance(candidate, str):
                         model = candidate
         except (httpx.HTTPError, ValueError):
@@ -158,10 +160,10 @@ class MetricsCollector:
             if response.status_code == 200:
                 samples = _parse_prometheus(response.text)
                 prompt_tps = _throughput(
-                    samples, "llama_prompt_tokens_per_second"
+                    samples, "llamacpp:prompt_tokens_seconds"
                 )
                 generation_tps = _throughput(
-                    samples, "llama_tokens_predicted_per_second"
+                    samples, "llamacpp:predicted_tokens_seconds"
                 )
         except (httpx.HTTPError, ValueError):
             pass

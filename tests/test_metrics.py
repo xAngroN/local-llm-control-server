@@ -25,12 +25,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PROFILES_TOML = REPO_ROOT / "config" / "profiles.toml"
 
 PROMETHEUS_SAMPLE = """\
-# HELP llama_prompt_tokens_per_second Prompt tokens per second
-# TYPE llama_prompt_tokens_per_second counter
-llama_prompt_tokens_per_second 51.0
-# HELP llama_tokens_predicted_per_second Predicted tokens per second
-# TYPE llama_tokens_predicted_per_second counter
-llama_tokens_predicted_per_second 30.0
+# HELP llamacpp:prompt_tokens_seconds Average prompt throughput in tokens/s
+# TYPE llamacpp:prompt_tokens_seconds gauge
+llamacpp:prompt_tokens_seconds 51.0
+# HELP llamacpp:predicted_tokens_seconds Average generation throughput in tokens/s
+# TYPE llamacpp:predicted_tokens_seconds gauge
+llamacpp:predicted_tokens_seconds 30.0
 some_other_metric 42.5
 bad_line_without_value
 """
@@ -79,8 +79,8 @@ def test_read_vram_missing_files_yield_none(tmp_path) -> None:
 
 def test_parse_prometheus_sample_numbers() -> None:
     samples = _parse_prometheus(PROMETHEUS_SAMPLE)
-    assert samples["llama_prompt_tokens_per_second"] == 51.0
-    assert samples["llama_tokens_predicted_per_second"] == 30.0
+    assert samples["llamacpp:prompt_tokens_seconds"] == 51.0
+    assert samples["llamacpp:predicted_tokens_seconds"] == 30.0
     assert samples["some_other_metric"] == 42.5
     # Comment lines and malformed lines are skipped.
     assert "bad_line_without_value" not in samples
@@ -101,7 +101,7 @@ def test_read_model_metrics_from_local_server(tmp_path) -> None:
     def handler(environ, start_response):
         path = environ["PATH_INFO"]
         if path == "/props":
-            body = b'{"model": "/models/qwen2.5-7b-instruct.gguf"}'
+            body = b'{"model_path": "/models/qwen2.5-7b-instruct.gguf"}'
             start_response("200 OK", [("Content-Type", "application/json")])
             return [body]
         if path == "/metrics":
@@ -150,7 +150,7 @@ def test_read_model_metrics_unexpected_prometheus_names_yield_none(monkeypatch) 
 
     def fake_get(url, **kwargs):
         if str(url).endswith("/props"):
-            return _FakeResponse(200, b'{"model": "/models/m.gguf"}', "application/json")
+            return _FakeResponse(200, b'{"model_path": "/models/m.gguf"}', "application/json")
         if str(url).endswith("/metrics"):
             return _FakeResponse(200, real_llamacpp_output.encode("ascii"), "text/plain")
         raise AssertionError(f"unexpected url {url}")
@@ -257,7 +257,7 @@ def test_get_metrics_endpoint_ready_returns_200(fake_podman, monkeypatch) -> Non
     def fake_get(url, **kwargs):
         if str(url).endswith("/props"):
             return _FakeResponse(
-                200, b'{"model": "/models/m.gguf"}', "application/json"
+                200, b'{"model_path": "/models/m.gguf"}', "application/json"
             )
         if str(url).endswith("/metrics"):
             return _FakeResponse(
@@ -266,6 +266,19 @@ def test_get_metrics_endpoint_ready_returns_200(fake_podman, monkeypatch) -> Non
         raise AssertionError(f"unexpected url {url}")
 
     monkeypatch.setattr(metrics_module.httpx, "get", fake_get)
+    # create_app() builds its own MetricsCollector() (imported into
+    # llamactl.api's namespace) with the real sysfs glob; without isolating
+    # it here, this assertion depends on whether the host running pytest
+    # happens to have amdgpu sysfs VRAM files (it does on the real
+    # deployment target), unlike every other VRAM check in this file which
+    # injects a fake path.
+    import llamactl.api as api_module
+
+    monkeypatch.setattr(
+        api_module,
+        "MetricsCollector",
+        lambda **kwargs: MetricsCollector(**{**kwargs, "vram_glob": "/nonexistent/*"}),
+    )
     client = TestClient(create_app(manager))
     # The context manager would trigger the startup reconcile, which resets
     # the tracker to stopped; enter it before setting the state instead.
@@ -279,7 +292,7 @@ def test_get_metrics_endpoint_ready_returns_200(fake_podman, monkeypatch) -> Non
     assert body["model"] == "/models/m.gguf"
     assert body["prompt_tps"] == 51.0
     assert body["generation_tps"] == 30.0
-    # VRAM baseline is still present (sysfs absent in tests -> None).
+    # VRAM baseline is still present (sysfs glob patched to not match -> None).
     assert body["vram"]["used_bytes"] is None
 
 

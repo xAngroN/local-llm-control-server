@@ -31,6 +31,11 @@ class PodmanError(RuntimeError):
 class Podman:
     """Thin wrapper around the podman CLI."""
 
+    #: Substrings podman uses for "no such container" across verbs and
+    #: versions -- ``inspect`` says "no such object" (podman 5.x), ``stop``/
+    #: ``rm`` say "no such container".
+    _NOT_FOUND_MARKERS = ("no such container", "no such object")
+
     def __init__(self, binary: str | None = None) -> None:
         # Resolve the binary at construction time, not import time, so the
         # LLAMACTL_PODMAN override stays effective for later lifecycle tests.
@@ -63,7 +68,8 @@ class Podman:
         try:
             self.run(["stop", "--time", str(timeout), name])
         except PodmanError as err:
-            if "no such container" not in err.stderr.lower():
+            stderr = err.stderr.lower()
+            if not any(marker in stderr for marker in self._NOT_FOUND_MARKERS):
                 raise
 
     def inspect(self, name: str) -> dict | None:
@@ -71,7 +77,8 @@ class Podman:
         try:
             out = self.run(["inspect", "--format", "json", name])
         except PodmanError as err:
-            if "no such container" in err.stderr.lower():
+            stderr = err.stderr.lower()
+            if any(marker in stderr for marker in self._NOT_FOUND_MARKERS):
                 return None
             raise
         data = json.loads(out)

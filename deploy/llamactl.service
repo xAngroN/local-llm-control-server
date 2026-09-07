@@ -9,6 +9,12 @@ Environment=LLAMACTL_PORT=8081
 Environment=LLAMACTL_PROFILES=%h/.config/llamactl/profiles.toml
 Restart=on-failure
 RestartSec=5
+# Default KillMode=control-group would send the stop signal to every
+# process in this unit's cgroup, including the detached podman model
+# container started via `podman run -d` -- restarting the control server
+# (e.g. after an update) would then kill the model it is supposed to be
+# managing. KillMode=process limits the signal to the main PID only.
+KillMode=process
 
 [Install]
 WantedBy=default.target

@@ -58,7 +58,14 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             common, profiles, Podman(), InstanceTracker()
         )
     tracker = manager._tracker
-    collector = MetricsCollector()
+    # The model server listens on common.host_port, not a fixed port -- both
+    # the health poller and the metrics collector must target that port
+    # instead of their class defaults, otherwise a non-default host_port
+    # (e.g. because 8080 is already taken by something else on the host)
+    # makes every probe miss the real server and demotes it to "degraded"
+    # even though it is healthy.
+    model_base_url = f"http://127.0.0.1:{manager._common.host_port}"
+    collector = MetricsCollector(base_url=model_base_url)
     # Event stream and health polling run in their own daemon threads and
     # are started with the app, so the API server sees crashes and
     # readiness without any HTTP request.  Both are torn down again on
@@ -68,7 +75,7 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
         manager._common.container_name,
         manager.handle_container_event,
     )
-    poller = HealthPoller(tracker)
+    poller = HealthPoller(tracker, base_url=model_base_url)
     # The host can suspend on its own (known bug with spontaneous
     # suspends), so the API also watches the logind PrepareForSleep
     # signal: on resume the real container state is re-collected via
