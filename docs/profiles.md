@@ -37,12 +37,17 @@ llama.cpp verwendet seinen eigenen Default.
 | `n_gpu_layers`     | `-ngl` / `--n-gpu-layers` | int        | Layer im VRAM (`999` = alle)                |
 | `flash_attn`       | `-fa` / `--flash-attn` | `on`/`off`/`auto` | Flash Attention                          |
 | `cont_batching`    | `-cb` / `-nocb`       | bool           | Continuous (dynamic) Batching               |
+| `cache_reuse`      | `--cache-reuse`       | int            | min. Chunk-Größe für KV-Cache-Reuse (0 = aus) |
 | `spec_type`        | `--spec-type`         | str            | Speculative-Decoding-Typ, `draft-mtp` = MTP |
 | `spec_draft_n_max` | `--spec-draft-n-max`  | int            | spec-max Tiefe (Draft-Tokens, Default 3)    |
 | `spec_draft_n_min` | `--spec-draft-n-min`  | int            | minimale Draft-Tokens                       |
 
 `-b` (logisches Batch) und `-ub` (physisches Micro-Batch) sind **zwei getrennte
 Felder** — `batch_size` ist nicht `-ub`.
+
+`cache_reuse` (`--cache-reuse N`) aktiviert das Wiederverwenden von KV-Cache-
+Segmenten per KV-Shifting über Requests hinweg (min. Chunk-Größe `N`, Default
+`0` = aus; setzt aktiviertes Prompt-Caching voraus).
 
 **MTP (Multi-Token-Prediction):** In der aktuellen llama.cpp ist MTP der
 Speculative-Decoding-Typ `draft-mtp` mit Self-Speculation (kein separates

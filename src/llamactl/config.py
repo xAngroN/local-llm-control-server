@@ -39,6 +39,7 @@ _TUNING_SPECS: tuple[tuple[str, object, str], ...] = (
     ("flash_attn", "--flash-attn", "value"),
     ("ubatch_size", "--ubatch-size", "value"),
     ("cont_batching", ("--cont-batching", "--no-cont-batching"), "bool"),
+    ("cache_reuse", "--cache-reuse", "value"),
     ("spec_type", "--spec-type", "value"),
     ("spec_draft_n_max", "--spec-draft-n-max", "value"),
     ("spec_draft_n_min", "--spec-draft-n-min", "value"),
@@ -76,6 +77,7 @@ class Profile:
     n_gpu_layers: int | None = None  # -ngl / --n-gpu-layers
     flash_attn: str | None = None  # -fa / --flash-attn: on|off|auto
     cont_batching: bool | None = None  # -cb / -nocb
+    cache_reuse: int | None = None  # --cache-reuse: min KV-shift reuse chunk
     spec_type: str | None = None  # --spec-type: e.g. draft-mtp for MTP
     spec_draft_n_max: int | None = None  # --spec-draft-n-max: spec-max depth
     spec_draft_n_min: int | None = None  # --spec-draft-n-min
@@ -114,6 +116,7 @@ class CommonConfig:
     n_gpu_layers: int | None = None
     flash_attn: str | None = None
     cont_batching: bool | None = None
+    cache_reuse: int | None = None
     spec_type: str | None = None
     spec_draft_n_max: int | None = None
     spec_draft_n_min: int | None = None
@@ -222,7 +225,13 @@ def render_podman_args(profile: Profile, common: CommonConfig) -> list[str]:
 
 #: Tuning keys that are integers (``None`` when absent).
 _INT_TUNING_KEYS = frozenset(
-    {"ubatch_size", "n_gpu_layers", "spec_draft_n_max", "spec_draft_n_min"}
+    {
+        "ubatch_size",
+        "n_gpu_layers",
+        "cache_reuse",
+        "spec_draft_n_max",
+        "spec_draft_n_min",
+    }
 )
 #: Tuning keys that are booleans (``None`` when absent).
 _BOOL_TUNING_KEYS = frozenset({"cont_batching"})

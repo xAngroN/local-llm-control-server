@@ -80,6 +80,32 @@ def test_profiles_json(client, capsys) -> None:
     assert json.loads(capsys.readouterr().out) == payload
 
 
+def test_profiles_with_name_hits_detail_endpoint(client, capsys) -> None:
+    fake = client(
+        FakeResponse({"ctx_size": 32768, "flash_attn": "on", "spec_type": None})
+    )
+    rc = main(["profiles", "safe"])
+    assert rc == 0
+    assert fake.calls == [("GET", "/profiles/safe", None, None)]
+    out = capsys.readouterr().out
+    assert "flash_attn on" in out
+
+
+def test_profiles_human_output_renders_nested_dicts(client, capsys) -> None:
+    # /profiles returns nested per-profile objects; the human renderer must
+    # indent them, not dump a raw Python dict repr on one line.
+    fake = client(
+        FakeResponse({"safe": {"ctx_size": 32768, "n_gpu_layers": 999}})
+    )
+    rc = main(["profiles"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "safe:" in out
+    assert "  ctx_size 32768" in out
+    assert "  n_gpu_layers 999" in out
+    assert "{" not in out  # no raw dict repr leaked
+
+
 def test_start_without_arg_uses_safe(client) -> None:
     fake = client(FakeResponse({"state": "starting"}))
     rc = main(["start"])

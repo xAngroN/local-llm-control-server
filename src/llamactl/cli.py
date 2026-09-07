@@ -45,10 +45,21 @@ def _print_json(payload) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def _print_key_value(payload: dict) -> None:
-    """Render a mapping as ``key value`` lines (one value per line)."""
+def _print_key_value(payload: dict, indent: int = 0) -> None:
+    """Render a mapping as ``key value`` lines (one value per line).
+
+    Nested mappings (as returned by ``/profiles`` per profile and by
+    ``/metrics`` for ``vram``) are printed as a ``key:`` header followed
+    by their entries indented two spaces, instead of dumping a raw Python
+    ``dict`` repr on one line.
+    """
+    pad = "  " * indent
     for key, value in payload.items():
-        print(f"{key} {value}")
+        if isinstance(value, dict):
+            print(f"{pad}{key}:")
+            _print_key_value(value, indent + 1)
+        else:
+            print(f"{pad}{key} {value}")
 
 
 def _print_lines(lines: list[str]) -> None:
@@ -85,6 +96,9 @@ def _call(command, method: str, path: str, payload: dict | None = None) -> int:
 
 
 def _cmd_profiles(args: argparse.Namespace) -> int:
+    name = getattr(args, "name", None)
+    if name:
+        return _call(args, "GET", f"/profiles/{name}")
     return _call(args, "GET", "/profiles")
 
 
@@ -204,8 +218,13 @@ def build_parser() -> _Parser:
 
     profiles = sub.add_parser(
         "profiles",
-        help="Liste der Profile (Sizing + effektives Tuning: -b/-ub, "
-        "-ngl, -fa, cont-batching, MTP/spec)",
+        help="Profile anzeigen (Sizing + effektives Tuning: -b/-ub, -ngl, "
+        "-fa, cont-batching, cache-reuse, MTP/spec). Mit NAME nur ein Profil.",
+    )
+    profiles.add_argument(
+        "name",
+        nargs="?",
+        help="Optionaler Profilname; zeigt nur dieses Profil (GET /profiles/<name>)",
     )
     profiles.set_defaults(func=_cmd_profiles)
     add_json_flag(profiles)

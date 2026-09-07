@@ -50,6 +50,7 @@ def _profile_detail(manager: LifecycleManager, name: str) -> dict:
         "n_gpu_layers": tuning["n_gpu_layers"],
         "flash_attn": tuning["flash_attn"],
         "cont_batching": tuning["cont_batching"],
+        "cache_reuse": tuning["cache_reuse"],
         "spec_type": tuning["spec_type"],
         "spec_draft_n_max": tuning["spec_draft_n_max"],
         "spec_draft_n_min": tuning["spec_draft_n_min"],

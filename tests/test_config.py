@@ -264,6 +264,7 @@ class TestTuning:
             "--flash-attn",
             "--cont-batching",
             "--no-cont-batching",
+            "--cache-reuse",
             "--spec-type",
             "--spec-draft-n-max",
             "--spec-draft-n-min",
@@ -276,6 +277,7 @@ class TestTuning:
             n_gpu_layers=999,
             flash_attn="on",
             cont_batching=True,
+            cache_reuse=256,
             spec_type="draft-mtp",
             spec_draft_n_max=4,
             spec_draft_n_min=0,
@@ -289,6 +291,7 @@ class TestTuning:
         assert pair("--n-gpu-layers") == "999"
         assert pair("--flash-attn") == "on"
         assert "--cont-batching" in args
+        assert pair("--cache-reuse") == "256"
         assert pair("--spec-type") == "draft-mtp"
         assert pair("--spec-draft-n-max") == "4"
         assert pair("--spec-draft-n-min") == "0"
