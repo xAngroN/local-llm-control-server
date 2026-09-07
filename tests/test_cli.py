@@ -151,6 +151,29 @@ def test_profile_delete_calls_delete(client) -> None:
     assert fake.calls[0][:2] == ("DELETE", "/profiles/shared")
 
 
+def test_preflight_calls_endpoint(client) -> None:
+    fake = client(FakeResponse({"fits": True, "basis": "estimate"}))
+    rc = main(["preflight", "safe"])
+    assert rc == 0
+    assert fake.calls[0][:2] == ("GET", "/profiles/safe/preflight")
+
+
+def test_trial_posts_timeout_and_keep(client) -> None:
+    fake = client(FakeResponse({"result": "ready"}))
+    rc = main(["trial", "fast", "--timeout", "30", "--keep"])
+    assert rc == 0
+    method, path, body, _ = fake.calls[0]
+    assert (method, path) == ("POST", "/profiles/fast/trial")
+    assert body == {"timeout": 30, "keep": True}
+
+
+def test_config_calls_endpoint(client) -> None:
+    fake = client(FakeResponse({"inference_url": "http://127.0.0.1:8000"}))
+    rc = main(["config"])
+    assert rc == 0
+    assert fake.calls[0][:2] == ("GET", "/config")
+
+
 def test_start_without_arg_uses_safe(client) -> None:
     fake = client(FakeResponse({"state": "starting"}))
     rc = main(["start"])

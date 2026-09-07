@@ -64,16 +64,20 @@ class InstanceTracker:
             return self._status.copy()
 
     def transition(self, state: InstanceState, **fields: object) -> None:
-        """Move the instance to ``state``, refreshing ``since``.
+        """Move the instance to ``state``, refreshing ``since`` on change.
 
-        Any additional keyword fields are applied to the status. When
-        transitioning to :attr:`InstanceState.STOPPED`, ``profile``,
-        ``container_id``, ``exit_code`` and ``log_tail`` are reset to their
-        empty values.
+        ``since`` records *since when the current state holds*, so it is
+        only reset when ``state`` actually differs from the current one --
+        a repeated same-state transition (e.g. the health poller renewing
+        ``ready`` every interval) leaves ``since`` untouched. Any additional
+        keyword fields are still applied regardless. When transitioning to
+        :attr:`InstanceState.STOPPED`, ``profile``, ``container_id``,
+        ``exit_code`` and ``log_tail`` are reset to their empty values.
         """
         with self._lock:
+            if state is not self._status.state:
+                self._status.since = datetime.now()
             self._status.state = state
-            self._status.since = datetime.now()
             if state is InstanceState.STOPPED:
                 self._status.profile = None
                 self._status.container_id = None

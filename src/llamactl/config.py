@@ -81,6 +81,16 @@ class Profile:
     spec_type: str | None = None  # --spec-type: e.g. draft-mtp for MTP
     spec_draft_n_max: int | None = None  # --spec-draft-n-max: spec-max depth
     spec_draft_n_min: int | None = None  # --spec-draft-n-min
+    # Measured peak GPU VRAM (bytes) from a previous run, plus when it was
+    # taken; cached back into the config by the metrics path. Bound to the
+    # parameters that produced it: any update_profile that rewrites the
+    # table drops these (the client never sends them), so a profile whose
+    # sizing changed reports "unknown" again. Never rendered into args.
+    measured_vram_peak_bytes: int | None = None
+    measured_vram_peak_at: str | None = None  # ISO-8601 UTC timestamp
+    # Free-form operator labels (e.g. {"tier": "large"}). llamactl only
+    # stores and returns them; it never interprets them.
+    labels: dict | None = None
     extra_args: tuple[str, ...] = ()
 
     @property
@@ -248,6 +258,9 @@ _PROFILE_KEYS = {
     "parallel",
     "batch_size",
     "extra_args",
+    "measured_vram_peak_bytes",
+    "measured_vram_peak_at",
+    "labels",
     *_TUNING_FIELDS,
 }
 
@@ -366,6 +379,19 @@ def _build_profile(name: str, table: dict, default_image: str) -> Profile:
         kv_cache_type_v=table["kv_cache_type_v"],
         parallel=int(table["parallel"]),
         batch_size=int(table["batch_size"]),
+        measured_vram_peak_bytes=(
+            int(table["measured_vram_peak_bytes"])
+            if "measured_vram_peak_bytes" in table
+            else None
+        ),
+        measured_vram_peak_at=(
+            str(table["measured_vram_peak_at"])
+            if "measured_vram_peak_at" in table
+            else None
+        ),
+        labels=(
+            dict(table["labels"]) if isinstance(table.get("labels"), dict) else None
+        ),
         extra_args=tuple(table.get("extra_args", ())),
         **_read_tuning(table),
     )
@@ -399,6 +425,9 @@ _PROFILE_WRITE_ORDER = (
     "parallel",
     "batch_size",
     *_TUNING_FIELDS,
+    "labels",
+    "measured_vram_peak_bytes",
+    "measured_vram_peak_at",
     "extra_args",
 )
 
@@ -410,7 +439,7 @@ def _toml_str(value: str) -> str:
 
 
 def _toml_value(value: object) -> str:
-    """Serialize a scalar / string-array profile value to TOML text."""
+    """Serialize a scalar / string-array / string-map profile value to TOML."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -419,6 +448,12 @@ def _toml_value(value: object) -> str:
         return _toml_str(value)
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_toml_str(str(item)) for item in value) + "]"
+    if isinstance(value, dict):
+        # Inline table, e.g. labels = { tier = "large" }.
+        items = ", ".join(
+            f"{key} = {_toml_value(val)}" for key, val in value.items()
+        )
+        return "{ " + items + " }" if items else "{}"
     raise ValueError(f"cannot serialize value {value!r} to TOML")
 
 
@@ -493,6 +528,35 @@ def overwrite_profile(path: Path, name: str, table: dict) -> None:
     start, end = span
     block_lines = format_profile_table(name, table).splitlines()
     lines[start:end] = block_lines
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def set_profile_value(path: Path, name: str, key: str, value: object) -> None:
+    """Set a single ``key = value`` inside an existing profile block.
+
+    Replaces the line for ``key`` if present, otherwise inserts it at the
+    end of the block. Everything else -- including inline comments and the
+    other profiles -- is left untouched, which makes this the cheap path
+    for the metrics layer to write back a ``measured_vram_peak_bytes``
+    without regenerating the whole table. Raises :class:`ValueError` when
+    the profile is absent.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    span = _profile_block_span(lines, name)
+    if span is None:
+        raise ValueError(f"profile {name!r} not found in {path}")
+    start, end = span
+    new_line = f"{key} = {_toml_value(value)}"
+    for i in range(start + 1, end):
+        stripped = lines[i].lstrip()
+        if stripped.startswith(f"{key} ") or stripped.startswith(f"{key}="):
+            lines[i] = new_line
+            break
+    else:
+        insert_at = end
+        while insert_at > start + 1 and lines[insert_at - 1].strip() == "":
+            insert_at -= 1
+        lines.insert(insert_at, new_line)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

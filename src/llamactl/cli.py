@@ -147,6 +147,21 @@ def _cmd_profile_delete(args: argparse.Namespace) -> int:
     return _call(args, "DELETE", f"/profiles/{args.name}")
 
 
+def _cmd_preflight(args: argparse.Namespace) -> int:
+    return _call(args, "GET", f"/profiles/{args.name}/preflight")
+
+
+def _cmd_trial(args: argparse.Namespace) -> int:
+    return _call(
+        args, "POST", f"/profiles/{args.name}/trial",
+        {"timeout": args.timeout, "keep": args.keep},
+    )
+
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    return _call(args, "GET", "/config")
+
+
 def _cmd_start(args: argparse.Namespace) -> int:
     profile = args.profile or DEFAULT_PROFILE
     return _call(args, "POST", "/start", {"profile": profile})
@@ -306,6 +321,38 @@ def build_parser() -> _Parser:
     profile_delete.add_argument("name", help="Name des Profils")
     profile_delete.set_defaults(func=_cmd_profile_delete)
     add_json_flag(profile_delete)
+
+    preflight = sub.add_parser(
+        "preflight",
+        help="Passt ein Profil in den VRAM? Schätzung ohne Laden "
+        "(GET /profiles/<name>/preflight)",
+    )
+    preflight.add_argument("name", help="Name des Profils")
+    preflight.set_defaults(func=_cmd_preflight)
+    add_json_flag(preflight)
+
+    trial = sub.add_parser(
+        "trial",
+        help="Profil einmal real laden und Ergebnis melden "
+        "(POST /profiles/<name>/trial)",
+    )
+    trial.add_argument("name", help="Name des Profils")
+    trial.add_argument(
+        "--timeout", type=int, default=60,
+        help="Sekunden auf Bereitschaft/Absturz warten (Default 60)",
+    )
+    trial.add_argument(
+        "--keep", action="store_true",
+        help="Bei Erfolg laufen lassen statt wieder stoppen",
+    )
+    trial.set_defaults(func=_cmd_trial)
+    add_json_flag(trial)
+
+    config = sub.add_parser(
+        "config", help="Server-Adressen (u. a. Inferenz-Port) (GET /config)"
+    )
+    config.set_defaults(func=_cmd_config)
+    add_json_flag(config)
 
     start = sub.add_parser(
         "start", help="Starte die Instanz (Default-Profil: 'safe')"

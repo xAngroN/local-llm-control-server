@@ -16,6 +16,7 @@ from llamactl.config import (
     render_podman_args,
     render_server_args,
     resolve_tuning,
+    set_profile_value,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -543,3 +544,39 @@ class TestProfilePersistence:
         f.write_text(_SRC_WITH_COMMENTS)
         with pytest.raises(ValueError, match="not found"):
             remove_profile(f, "nope")
+
+    def test_labels_serialize_as_inline_table_and_roundtrip(self, tmp_path) -> None:
+        f = tmp_path / "p.toml"
+        f.write_text(_SRC_WITH_COMMENTS)
+        append_profile(
+            f, "big",
+            {
+                "model": "m.gguf", "ctx_size": 4096, "kv_cache_type_k": "q8_0",
+                "kv_cache_type_v": "q8_0", "parallel": 1, "batch_size": 512,
+                "labels": {"tier": "large", "team": "infra"},
+            },
+        )
+        assert 'labels = { tier = "large", team = "infra" }' in f.read_text()
+        _, profiles = load_config(f)
+        assert profiles["big"].labels == {"tier": "large", "team": "infra"}
+
+    def test_set_profile_value_inserts_then_replaces(self, tmp_path) -> None:
+        f = tmp_path / "p.toml"
+        f.write_text(_SRC_WITH_COMMENTS)
+        # Insert a new key into the existing block...
+        set_profile_value(f, "safe", "measured_vram_peak_bytes", 123)
+        _, profiles = load_config(f)
+        assert profiles["safe"].measured_vram_peak_bytes == 123
+        assert "# comment above safe" in f.read_text()  # comment preserved
+        # ...then replace it in place (no duplicate line).
+        set_profile_value(f, "safe", "measured_vram_peak_bytes", 456)
+        text = f.read_text()
+        assert text.count("measured_vram_peak_bytes") == 1
+        _, profiles = load_config(f)
+        assert profiles["safe"].measured_vram_peak_bytes == 456
+
+    def test_set_profile_value_absent_raises(self, tmp_path) -> None:
+        f = tmp_path / "p.toml"
+        f.write_text(_SRC_WITH_COMMENTS)
+        with pytest.raises(ValueError, match="not found"):
+            set_profile_value(f, "nope", "measured_vram_peak_bytes", 1)

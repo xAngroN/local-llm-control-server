@@ -113,3 +113,62 @@ bleiben synchron, sodass ein Dienst-Neustart dieselben Profile lädt.
 > Sicherheit: Die Control-API ist unauthentifiziert. Wer sie erreicht, kann
 > Profile mit beliebigen `model`-Pfaden und `extra_args` anlegen. Bind an
 > `127.0.0.1` binden oder Auth vorschalten, wenn das nicht erwünscht ist.
+
+## Modellgeometrie, Speicherbedarf und Fit-Check
+
+`GET /profiles/{name}` liefert zusätzlich zur Konfiguration:
+
+- `model_file_size_bytes` — Dateigröße des GGUF.
+- `kv_cache_type_k` / `kv_cache_type_v` — bestimmen die KV-Cache-Breite.
+- `geometry` — aus dem GGUF-Header gelesen (`architecture`, `n_layers`,
+  `n_embd`, `n_head`, `n_head_kv`, `head_dim`, `context_length`, `quant`),
+  oder `null`, wenn die Datei fehlt/unlesbar ist.
+- `estimated_vram` — Schätzung `{weights + kv_cache + overhead = total}`.
+  Der KV-Term nimmt **alle** Layer an, ist also eine **Obergrenze**;
+  Hybrid-/SWA-Modelle (nur ein Teil der Layer hält KV) brauchen weniger.
+- `vram` — der **gemessene** Spitzenwert:
+
+  ```json
+  "vram": { "peak_bytes": 18360000000, "measured_at": "2026-09-07T…Z", "source": "measured" }
+  ```
+
+  `source` ist `"unknown"`, solange das Profil nie lief. Sobald es lief und
+  `GET /metrics` das erste Mal abgefragt wurde, hält llamactl den Peak in der
+  Config fest (überlebt Neustart). **Der Wert ist an die Parameter gebunden,
+  die ihn erzeugt haben:** jedes `PUT /profiles/{name}`, das die Config neu
+  schreibt, verwirft ihn (`source` zurück auf `"unknown"`).
+
+### Passt ein Profil? — ohne Absturz herausfinden
+
+- `GET /profiles/{name}/preflight` — **Schätzung ohne Laden**. Vergleicht den
+  Bedarf gegen den freien VRAM. `basis` ist `"measured"`, wenn ein gemessener
+  Peak vorliegt (bevorzugt, exakt), sonst `"estimate"` (Obergrenze). Liefert
+  `required_*`, `total_vram_*`, `headroom_*` und `fits`.
+- `POST /profiles/{name}/trial` — **realer geführter Probelauf**. Lädt das
+  Profil einmal, wartet bis `ready` / Container-Tod (`crashed`, meist OOM) /
+  `timeout`, erfasst den Peak-VRAM und einen `log_tail`, und stoppt danach
+  wieder (außer `{"keep": true}` und es wurde `ready`). `409`, wenn bereits
+  eine Instanz aktiv ist (erst stoppen). Body: `{"timeout": 60, "keep": false}`.
+
+CLI: `llamactl preflight <name>`, `llamactl trial <name> [--timeout N] [--keep]`.
+
+## Weitere Endpoints
+
+- `GET /logs?tail=N` — die letzten `N` Zeilen des Modellcontainers (auch nach
+  dessen Ende), z. B. um nach einem Absturz den Grund (OOM) zu sehen.
+- `GET /config` — statische Server-Adressen, u. a. `inference_host_port` /
+  `inference_url` (wo `/v1/...` bedient wird), damit der Client die
+  Inferenz-Adresse nicht separat pflegen muss.
+- `GET /status` nennt zusätzlich das `model` des laufenden Profils; `since`
+  bleibt konstant, solange der Zustand unverändert ist.
+
+## Freie Labels
+
+Profile können ein freies `labels`-Objekt tragen (z. B. `{"tier": "large"}`),
+das llamactl nur speichert und ausliefert, nie interpretiert — nützlich, um
+einem Consumer die Güteklasse eines Modells dort zu hinterlegen, wo das Profil
+entsteht:
+
+```
+llamactl profile-create qwen-mtp --fields '{..., "labels": {"tier": "large"}}'
+```

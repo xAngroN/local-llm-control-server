@@ -96,6 +96,36 @@ def test_transition_updates_since_and_fields() -> None:
     assert snap.since >= before
 
 
+def test_since_is_stable_across_same_state_transitions() -> None:
+    # Consumer requirement 3.2: `since` records since when the *state*
+    # holds, so re-entering the same state (e.g. the health poller renewing
+    # `ready` every interval) must not move it -- only a real change does.
+    tracker = InstanceTracker()
+    tracker.transition(InstanceState.LOADING, profile="p")
+    first = tracker.snapshot().since
+    tracker.transition(InstanceState.READY)
+    ready_since = tracker.snapshot().since
+    assert ready_since >= first
+    # Renew READY several times: since must stay put.
+    for _ in range(3):
+        tracker.transition(InstanceState.READY)
+    assert tracker.snapshot().since == ready_since
+    # A genuine change moves it again.
+    tracker.transition(InstanceState.DEGRADED)
+    assert tracker.snapshot().since >= ready_since
+
+
+def test_same_state_transition_still_applies_fields() -> None:
+    tracker = InstanceTracker()
+    tracker.transition(InstanceState.READY, profile="p", container_id="c1")
+    since = tracker.snapshot().since
+    # Same-state re-transition updates fields but not since.
+    tracker.transition(InstanceState.READY, container_id="c2")
+    snap = tracker.snapshot()
+    assert snap.container_id == "c2"
+    assert snap.since == since
+
+
 def test_stopped_resets_profile_container_exitcode_logtail() -> None:
     tracker = InstanceTracker()
     tracker.transition(

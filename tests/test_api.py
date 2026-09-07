@@ -219,6 +219,115 @@ def test_cannot_delete_or_update_running_profile(fake_podman, tmp_path) -> None:
     ).status_code == 409
 
 
+# --- geometry / VRAM measurement / labels / config / logs ------------------
+
+def test_profile_detail_exposes_kv_types_labels_and_vram(fake_podman) -> None:
+    client = make_client(fake_podman)
+    body = client.get("/profiles/safe").json()
+    # kv cache types are now in the response (consumer 4.2).
+    assert body["kv_cache_type_k"] == "q8_0"
+    assert body["kv_cache_type_v"] == "q8_0"
+    # labels default to an empty object (consumer 4.3).
+    assert body["labels"] == {}
+    # never-run profile reports an unknown VRAM measurement (consumer 4.1).
+    assert body["vram"] == {
+        "peak_bytes": None,
+        "measured_at": None,
+        "source": "unknown",
+    }
+    # geometry/estimate keys present (None here: fixture model file absent).
+    assert "geometry" in body
+    assert "estimated_vram" in body
+
+
+def test_measured_peak_recorded_then_invalidated_by_update(
+    fake_podman, tmp_path
+) -> None:
+    client, _ = make_writable_client(fake_podman, tmp_path)
+    manager = client.app.state.manager
+    manager.record_vram_peak("fast", 17_000_000_000)
+    body = client.get("/profiles/fast").json()
+    assert body["vram"]["source"] == "measured"
+    assert body["vram"]["peak_bytes"] == 17_000_000_000
+    assert body["vram"]["measured_at"]
+    # An update that rewrites the profile drops the measurement (bound to
+    # the parameters that produced it) -> back to unknown.
+    client.put(
+        "/profiles/fast",
+        json={
+            "model": "fast.gguf", "ctx_size": 8192, "kv_cache_type_k": "f16",
+            "kv_cache_type_v": "f16", "parallel": 1, "batch_size": 256,
+        },
+    )
+    body = client.get("/profiles/fast").json()
+    assert body["vram"]["source"] == "unknown"
+    assert body["vram"]["peak_bytes"] is None
+
+
+def test_create_profile_with_labels_roundtrips(fake_podman, tmp_path) -> None:
+    client, cfg = make_writable_client(fake_podman, tmp_path)
+    client.post("/profiles", json=_new_profile_body(labels={"tier": "large"}))
+    body = client.get("/profiles/mtp").json()
+    assert body["labels"] == {"tier": "large"}
+    _, profiles = load_config(cfg)
+    assert profiles["mtp"].labels == {"tier": "large"}
+
+
+def test_config_endpoint_reports_inference_address(fake_podman) -> None:
+    client = make_client(fake_podman)
+    body = client.get("/config").json()
+    assert body["inference_host_port"] == 8080
+    assert body["inference_url"].endswith(":8080")
+    assert "models_dir" in body
+
+
+def test_preflight_returns_fit_structure(fake_podman) -> None:
+    client = make_client(fake_podman)
+    body = client.get("/profiles/safe/preflight").json()
+    # Structure is present even when the model file is absent (estimate None).
+    assert body["profile"] == "safe"
+    assert body["basis"] in ("measured", "estimate")
+    assert "fits" in body
+    assert "total_vram_bytes" in body
+
+
+def test_preflight_unknown_404(fake_podman) -> None:
+    client = make_client(fake_podman)
+    assert client.get("/profiles/nope/preflight").status_code == 404
+
+
+def test_logs_endpoint_returns_lines(fake_podman) -> None:
+    client = make_client(fake_podman)
+    client.post("/start", json={"profile": "fast"})
+    response = client.get("/logs")
+    assert response.status_code == 200
+    assert isinstance(response.json()["lines"], list)
+
+
+def test_trial_unknown_404(fake_podman) -> None:
+    client = make_client(fake_podman)
+    assert client.post("/profiles/nope/trial", json={}).status_code == 404
+
+
+def test_trial_conflicts_when_instance_active(fake_podman) -> None:
+    client = make_client(fake_podman)
+    client.post("/start", json={"profile": "fast"})
+    response = client.post("/profiles/safe/trial", json={"timeout": 0})
+    assert response.status_code == 409
+
+
+def test_trial_timeout_zero_starts_and_stops(fake_podman) -> None:
+    client = make_client(fake_podman)
+    response = client.post("/profiles/fast/trial", json={"timeout": 0})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["started"] is True
+    assert body["result"] == "timeout"
+    assert body["ready"] is False
+    # Trial cleaned up: nothing is left active.
+    assert client.get("/status").json()["state"] in ("stopped", "crashed")
+
+
 def test_start_valid_profile_returns_state_and_runs_container(fake_podman) -> None:
     client = make_client(fake_podman)
     response = client.post("/start", json={"profile": "fast"})

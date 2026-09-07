@@ -13,6 +13,8 @@ module.
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import (
@@ -24,6 +26,7 @@ from .config import (
     remove_profile,
     render_podman_args,
     resolve_profiles_path,
+    set_profile_value,
 )
 from .podman import Podman, PodmanError
 from .state import InstanceState, InstanceStatus, InstanceTracker
@@ -155,6 +158,39 @@ class LifecycleManager:
                 )
             remove_profile(self._profiles_path(), name)
             del self._profiles[name]
+
+    def record_vram_peak(self, name: str, used_bytes: int | None) -> int | None:
+        """Update and persist a profile's measured peak VRAM (monotonic).
+
+        Called from the metrics path with the currently used VRAM. The
+        peak only ever grows; when it does, the new value is cached back
+        into the config file (best effort -- a write failure keeps the
+        in-memory peak). Returns the current peak, or ``None`` for an
+        unknown profile / missing reading.
+        """
+        if used_bytes is None:
+            return None
+        with self._lock:
+            profile = self._profiles.get(name)
+            if profile is None:
+                return None
+            current = profile.measured_vram_peak_bytes or 0
+            if used_bytes <= current:
+                return profile.measured_vram_peak_bytes
+            peak = int(used_bytes)
+            at = datetime.now(timezone.utc).isoformat()
+            self._profiles[name] = replace(
+                profile,
+                measured_vram_peak_bytes=peak,
+                measured_vram_peak_at=at,
+            )
+            try:
+                path = self._profiles_path()
+                set_profile_value(path, name, "measured_vram_peak_bytes", peak)
+                set_profile_value(path, name, "measured_vram_peak_at", at)
+            except (OSError, ValueError):
+                pass  # in-memory peak stands even if persistence fails
+            return peak
 
     def start(self, profile_name: str) -> InstanceStatus:
         """Start the model instance for ``profile_name``.
