@@ -12,12 +12,14 @@ from contextlib import asynccontextmanager
 from fastapi import Body, FastAPI, HTTPException
 
 from llamactl import __version__
-from llamactl.config import load_config, resolve_tuning
+from llamactl.config import load_config, resolve_profiles_path, resolve_tuning
 from llamactl.events import ContainerEventWatcher
 from llamactl.health import HealthPoller
 from llamactl.lifecycle import (
     AlreadyRunningError,
     LifecycleManager,
+    ProfileExistsError,
+    ProfileInUseError,
     UnknownProfileError,
 )
 from llamactl.metrics import MetricsCollector
@@ -99,9 +101,10 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
     but does not prevent the server from starting.
     """
     if manager is None:
-        common, profiles = load_config()
+        path = resolve_profiles_path()
+        common, profiles = load_config(path)
         manager = LifecycleManager(
-            common, profiles, Podman(), InstanceTracker()
+            common, profiles, Podman(), InstanceTracker(), config_path=path
         )
     tracker = manager._tracker
     # The model server listens on common.host_port, not a fixed port -- both
@@ -163,6 +166,63 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
         if name not in manager.list_profiles():
             raise HTTPException(404, detail=f"unknown profile {name!r}")
         return _profile_detail(manager, name)
+
+    @app.post("/profiles", status_code=201)
+    def create_profile(payload: dict = Body(...)) -> dict:
+        """Create and persist a new profile.
+
+        Body: the profile fields plus a ``name`` (e.g.
+        ``{"name": "x", "model": "m.gguf", "ctx_size": 4096, ...}``).
+        Returns the created profile's effective detail. 409 if the name
+        exists, 422 on invalid/missing fields.
+        """
+        table = dict(payload)
+        name = table.pop("name", None)
+        if not isinstance(name, str) or not name:
+            raise HTTPException(422, detail="missing 'name' field")
+        try:
+            manager.create_profile(name, table)
+        except ProfileExistsError as err:
+            raise HTTPException(409, detail=str(err)) from err
+        except ValueError as err:
+            raise HTTPException(422, detail=str(err)) from err
+        except OSError as err:
+            raise HTTPException(500, detail=f"could not persist profile: {err}") from err
+        return _profile_detail(manager, name)
+
+    @app.put("/profiles/{name}")
+    def update_profile(name: str, payload: dict = Body(...)) -> dict:
+        """Replace an existing profile's fields (in memory and on disk).
+
+        404 if unknown, 409 if it is the running instance's profile, 422
+        on invalid fields.
+        """
+        table = dict(payload)
+        table.pop("name", None)  # name comes from the path; ignore any in body
+        try:
+            manager.update_profile(name, table)
+        except UnknownProfileError as err:
+            raise HTTPException(404, detail=str(err)) from err
+        except ProfileInUseError as err:
+            raise HTTPException(409, detail=str(err)) from err
+        except ValueError as err:
+            raise HTTPException(422, detail=str(err)) from err
+        except OSError as err:
+            raise HTTPException(500, detail=f"could not persist profile: {err}") from err
+        return _profile_detail(manager, name)
+
+    @app.delete("/profiles/{name}")
+    def delete_profile(name: str) -> dict:
+        """Delete a profile. 404 if unknown, 409 if it is in use."""
+        try:
+            manager.delete_profile(name)
+        except UnknownProfileError as err:
+            raise HTTPException(404, detail=str(err)) from err
+        except ProfileInUseError as err:
+            raise HTTPException(409, detail=str(err)) from err
+        except OSError as err:
+            raise HTTPException(500, detail=f"could not persist profile: {err}") from err
+        return {"deleted": name}
 
     @app.post("/start")
     def start(payload: dict = Body(...)) -> dict:

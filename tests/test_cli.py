@@ -106,6 +106,51 @@ def test_profiles_human_output_renders_nested_dicts(client, capsys) -> None:
     assert "{" not in out  # no raw dict repr leaked
 
 
+def test_profile_create_posts_body_with_name(client) -> None:
+    fake = client(FakeResponse({"model": "m.gguf"}, status_code=201))
+    rc = main([
+        "profile-create", "mtp",
+        "--fields", '{"model":"m.gguf","ctx_size":4096,'
+        '"kv_cache_type_k":"q8_0","kv_cache_type_v":"q8_0",'
+        '"parallel":1,"batch_size":512,"spec_type":"draft-mtp"}',
+    ])
+    assert rc == 0
+    method, path, body, _ = fake.calls[0]
+    assert (method, path) == ("POST", "/profiles")
+    assert body["name"] == "mtp"  # name injected from the positional arg
+    assert body["model"] == "m.gguf"
+    assert body["spec_type"] == "draft-mtp"
+
+
+def test_profile_create_invalid_json_returns_2(client, capsys) -> None:
+    client(FakeResponse({}))
+    rc = main(["profile-create", "x", "--fields", "not json"])
+    assert rc == 2
+    assert "JSON" in capsys.readouterr().err
+
+
+def test_profile_update_puts_body(client) -> None:
+    fake = client(FakeResponse({"ctx_size": 8192}))
+    rc = main([
+        "profile-update", "fast",
+        "--fields", '{"model":"fast.gguf","ctx_size":8192,'
+        '"kv_cache_type_k":"f16","kv_cache_type_v":"f16",'
+        '"parallel":1,"batch_size":256}',
+    ])
+    assert rc == 0
+    method, path, body, _ = fake.calls[0]
+    assert (method, path) == ("PUT", "/profiles/fast")
+    assert body["ctx_size"] == 8192
+    assert "name" not in body
+
+
+def test_profile_delete_calls_delete(client) -> None:
+    fake = client(FakeResponse({"deleted": "shared"}))
+    rc = main(["profile-delete", "shared"])
+    assert rc == 0
+    assert fake.calls[0][:2] == ("DELETE", "/profiles/shared")
+
+
 def test_start_without_arg_uses_safe(client) -> None:
     fake = client(FakeResponse({"state": "starting"}))
     rc = main(["start"])

@@ -13,8 +13,18 @@ module.
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
-from .config import CommonConfig, Profile, render_podman_args
+from .config import (
+    CommonConfig,
+    Profile,
+    append_profile,
+    build_profile,
+    overwrite_profile,
+    remove_profile,
+    render_podman_args,
+    resolve_profiles_path,
+)
 from .podman import Podman, PodmanError
 from .state import InstanceState, InstanceStatus, InstanceTracker
 
@@ -41,6 +51,14 @@ class AlreadyRunningError(RuntimeError):
     """Raised when an instance is already active or its container is running."""
 
 
+class ProfileExistsError(ValueError):
+    """Raised when creating a profile whose name is already configured."""
+
+
+class ProfileInUseError(RuntimeError):
+    """Raised when editing/deleting the profile of the running instance."""
+
+
 class LifecycleManager:
     """Owns the start flow for the single model instance."""
 
@@ -50,11 +68,16 @@ class LifecycleManager:
         profiles: dict[str, Profile],
         podman: Podman,
         tracker: InstanceTracker,
+        config_path: Path | None = None,
     ) -> None:
         self._common = common
         self._profiles = profiles
         self._podman = podman
         self._tracker = tracker
+        # File that profile CRUD persists to. ``None`` -> resolved lazily
+        # via the same LLAMACTL_PROFILES/default logic as load_config, so a
+        # manager built from the default config writes back to that file.
+        self._config_path = config_path
         self._lock = threading.Lock()
         # Marks the most recent shutdown as self-initiated.  Crash
         # detection later reads this flag so a deliberate stop is not
@@ -64,6 +87,74 @@ class LifecycleManager:
     def list_profiles(self) -> list[str]:
         """Return the names of all configured profiles."""
         return list(self._profiles)
+
+    # ------------------------------------------------------------------
+    # Profile CRUD (validated in-memory update + persisted to the file)
+    # ------------------------------------------------------------------
+
+    def _profiles_path(self) -> Path:
+        """Resolve the file profile CRUD reads/writes."""
+        return resolve_profiles_path(self._config_path)
+
+    def _active_profile(self) -> str | None:
+        """Name of the profile of a non-stopped instance, else ``None``."""
+        status = self._tracker.snapshot()
+        if status.state in _INACTIVE_STATES:
+            return None
+        return status.profile
+
+    def create_profile(self, name: str, table: dict) -> Profile:
+        """Validate, register and persist a new profile.
+
+        ``table`` is the raw key/value mapping (without ``name``). Raises
+        :class:`ProfileExistsError` if the name is taken and
+        :class:`ValueError` on invalid fields; nothing is persisted in
+        either case. On success the profile is added to the in-memory set
+        and appended to the config file (existing comments preserved).
+        """
+        with self._lock:
+            if name in self._profiles:
+                raise ProfileExistsError(f"profile {name!r} already exists")
+            profile = build_profile(name, table, self._common.image)
+            append_profile(self._profiles_path(), name, table)
+            self._profiles[name] = profile
+            return profile
+
+    def update_profile(self, name: str, table: dict) -> Profile:
+        """Replace an existing profile's fields, in memory and on disk.
+
+        Raises :class:`UnknownProfileError` when the profile does not
+        exist, :class:`ProfileInUseError` when it is the profile of the
+        currently running instance (stop it first), and :class:`ValueError`
+        on invalid fields. Persistence rewrites only this profile's table.
+        """
+        with self._lock:
+            if name not in self._profiles:
+                raise UnknownProfileError(f"unknown profile: {name!r}")
+            if self._active_profile() == name:
+                raise ProfileInUseError(
+                    f"profile {name!r} is in use by the running instance"
+                )
+            profile = build_profile(name, table, self._common.image)
+            overwrite_profile(self._profiles_path(), name, table)
+            self._profiles[name] = profile
+            return profile
+
+    def delete_profile(self, name: str) -> None:
+        """Remove a profile from memory and the config file.
+
+        Raises :class:`UnknownProfileError` when absent and
+        :class:`ProfileInUseError` when it belongs to the running instance.
+        """
+        with self._lock:
+            if name not in self._profiles:
+                raise UnknownProfileError(f"unknown profile: {name!r}")
+            if self._active_profile() == name:
+                raise ProfileInUseError(
+                    f"profile {name!r} is in use by the running instance"
+                )
+            remove_profile(self._profiles_path(), name)
+            del self._profiles[name]
 
     def start(self, profile_name: str) -> InstanceStatus:
         """Start the model instance for ``profile_name``.

@@ -79,3 +79,37 @@ auslesbar:
 - `GET /profiles/{name}` — ein einzelnes Profil (404 bei unbekanntem Namen).
 
 Auf der Kommandozeile liefert `llamactl profiles --json` denselben Inhalt.
+
+## Profile anlegen / ändern / löschen (CRUD)
+
+Profile können über die API erzeugt, geändert und gelöscht werden. Änderungen
+werden **persistent** in die aktive Profildatei (`LLAMACTL_PROFILES`)
+geschrieben; vorhandene Kommentare/Notizen bleiben erhalten (Anlegen hängt einen
+neuen `[profiles.<name>]`-Block an, Ändern ersetzt nur den betreffenden Block,
+Löschen entfernt nur ihn).
+
+- `POST /profiles` — Body sind die Profilfelder **plus** `name`, z. B.
+  `{"name":"qwen-mtp","model":"m.gguf","ctx_size":32768,"kv_cache_type_k":"q8_0","kv_cache_type_v":"q8_0","parallel":1,"batch_size":512,"spec_type":"draft-mtp","spec_draft_n_max":4}`.
+  `201` bei Erfolg, `409` wenn der Name existiert, `422` bei ungültigen/fehlenden Feldern.
+- `PUT /profiles/{name}` — ersetzt die Felder eines Profils. `404` unbekannt,
+  `409` wenn es das Profil der **laufenden** Instanz ist (erst stoppen), `422` ungültig.
+- `DELETE /profiles/{name}` — löscht ein Profil. `404` unbekannt, `409` wenn in Benutzung.
+
+Auf der Kommandozeile (Felder als JSON via `--fields` oder stdin):
+
+```
+llamactl profile-create qwen-mtp --fields '{"model":"m.gguf","ctx_size":32768,
+  "kv_cache_type_k":"q8_0","kv_cache_type_v":"q8_0","parallel":1,"batch_size":512,
+  "spec_type":"draft-mtp","spec_draft_n_max":4}'
+llamactl profile-update safe --fields '{"model":"...","ctx_size":16384, ...}'
+llamactl profile-delete qwen-mtp
+```
+
+Nur die Sizing-Pflichtfelder (`model`, `ctx_size`, `kv_cache_type_k`,
+`kv_cache_type_v`, `parallel`, `batch_size`) sind erforderlich; alle
+Tuning-Felder sind optional. Das laufende `manager._profiles` und die Datei
+bleiben synchron, sodass ein Dienst-Neustart dieselben Profile lädt.
+
+> Sicherheit: Die Control-API ist unauthentifiziert. Wer sie erreicht, kann
+> Profile mit beliebigen `model`-Pfaden und `extra_args` anlegen. Bind an
+> `127.0.0.1` binden oder Auth vorschalten, wenn das nicht erwünscht ist.

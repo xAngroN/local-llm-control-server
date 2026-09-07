@@ -24,6 +24,22 @@ def make_client(fake_podman) -> TestClient:
     return TestClient(create_app(manager))
 
 
+def make_writable_client(fake_podman, tmp_path) -> tuple[TestClient, Path]:
+    """TestClient whose manager persists profile CRUD to a temp config file.
+
+    Copies the bundled profiles.toml into ``tmp_path`` so profile
+    create/update/delete never touch the repo fixture. Returns
+    ``(client, config_path)``.
+    """
+    cfg = tmp_path / "profiles.toml"
+    cfg.write_text(PROFILES_TOML.read_text(encoding="utf-8"), encoding="utf-8")
+    common, profiles = load_config(cfg)
+    manager = LifecycleManager(
+        common, profiles, Podman(), InstanceTracker(), config_path=cfg
+    )
+    return TestClient(create_app(manager)), cfg
+
+
 def test_healthz_returns_ok(fake_podman) -> None:
     client = make_client(fake_podman)
     response = client.get("/healthz")
@@ -84,6 +100,123 @@ def test_profile_detail_unknown_returns_404(fake_podman) -> None:
     response = client.get("/profiles/nope")
     assert response.status_code == 404
     assert "nope" in response.json()["detail"]
+
+
+# --- Profile CRUD ---------------------------------------------------------
+
+def _new_profile_body(**over) -> dict:
+    body = {
+        "name": "mtp",
+        "model": "m.gguf",
+        "ctx_size": 4096,
+        "kv_cache_type_k": "q8_0",
+        "kv_cache_type_v": "q8_0",
+        "parallel": 1,
+        "batch_size": 512,
+        "spec_type": "draft-mtp",
+        "spec_draft_n_max": 4,
+    }
+    body.update(over)
+    return body
+
+
+def test_create_profile_persists_and_is_listed(fake_podman, tmp_path) -> None:
+    client, cfg = make_writable_client(fake_podman, tmp_path)
+    response = client.post("/profiles", json=_new_profile_body())
+    assert response.status_code == 201
+    body = response.json()
+    assert body["model"] == "m.gguf"
+    assert body["spec_type"] == "draft-mtp"
+    assert body["spec_draft_n_max"] == 4
+    # visible via the API...
+    assert "mtp" in client.get("/profiles").json()
+    assert client.get("/profiles/mtp").status_code == 200
+    # ...and persisted to the file (survives a fresh load).
+    _, profiles = load_config(cfg)
+    assert "mtp" in profiles
+    # existing comments were preserved.
+    assert "shared" in cfg.read_text()
+
+
+def test_create_duplicate_returns_409(fake_podman, tmp_path) -> None:
+    client, _ = make_writable_client(fake_podman, tmp_path)
+    response = client.post("/profiles", json=_new_profile_body(name="safe"))
+    assert response.status_code == 409
+
+
+def test_create_missing_field_returns_422(fake_podman, tmp_path) -> None:
+    client, cfg = make_writable_client(fake_podman, tmp_path)
+    body = _new_profile_body()
+    del body["ctx_size"]
+    response = client.post("/profiles", json=body)
+    assert response.status_code == 422
+    # nothing was written.
+    assert "mtp" not in load_config(cfg)[1]
+
+
+def test_create_without_name_returns_422(fake_podman, tmp_path) -> None:
+    client, _ = make_writable_client(fake_podman, tmp_path)
+    body = _new_profile_body()
+    del body["name"]
+    assert client.post("/profiles", json=body).status_code == 422
+
+
+def test_update_profile_changes_fields(fake_podman, tmp_path) -> None:
+    client, cfg = make_writable_client(fake_podman, tmp_path)
+    response = client.put(
+        "/profiles/fast",
+        json={
+            "model": "fast.gguf",
+            "ctx_size": 8192,
+            "kv_cache_type_k": "f16",
+            "kv_cache_type_v": "f16",
+            "parallel": 1,
+            "batch_size": 256,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["ctx_size"] == 8192
+    _, profiles = load_config(cfg)
+    assert profiles["fast"].ctx_size == 8192
+    assert profiles["fast"].batch_size == 256
+
+
+def test_update_unknown_returns_404(fake_podman, tmp_path) -> None:
+    client, _ = make_writable_client(fake_podman, tmp_path)
+    response = client.put("/profiles/nope", json=_new_profile_body())
+    assert response.status_code == 404
+
+
+def test_delete_profile_removes_it(fake_podman, tmp_path) -> None:
+    client, cfg = make_writable_client(fake_podman, tmp_path)
+    response = client.delete("/profiles/shared")
+    assert response.status_code == 200
+    assert response.json()["deleted"] == "shared"
+    assert "shared" not in client.get("/profiles").json()
+    assert "shared" not in load_config(cfg)[1]
+
+
+def test_delete_unknown_returns_404(fake_podman, tmp_path) -> None:
+    client, _ = make_writable_client(fake_podman, tmp_path)
+    assert client.delete("/profiles/nope").status_code == 404
+
+
+def test_cannot_delete_or_update_running_profile(fake_podman, tmp_path) -> None:
+    client, _ = make_writable_client(fake_podman, tmp_path)
+    assert client.post("/start", json={"profile": "fast"}).status_code == 200
+    # fast is now the active (loading) profile.
+    assert client.delete("/profiles/fast").status_code == 409
+    assert client.put(
+        "/profiles/fast",
+        json={
+            "model": "fast.gguf",
+            "ctx_size": 8192,
+            "kv_cache_type_k": "f16",
+            "kv_cache_type_v": "f16",
+            "parallel": 1,
+            "batch_size": 256,
+        },
+    ).status_code == 409
 
 
 def test_start_valid_profile_returns_state_and_runs_container(fake_podman) -> None:

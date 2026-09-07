@@ -7,7 +7,12 @@ import pytest
 from llamactl.config import (
     CommonConfig,
     Profile,
+    append_profile,
+    build_profile,
+    format_profile_table,
     load_config,
+    overwrite_profile,
+    remove_profile,
     render_podman_args,
     render_server_args,
     resolve_tuning,
@@ -365,3 +370,176 @@ class TestTuning:
         )
         with pytest.raises(ValueError, match="flash_attn"):
             load_config(file)
+
+
+_SRC_WITH_COMMENTS = """\
+# top comment
+[common]
+image = "img"
+models_dir = "/m"
+container_name = "c"
+host_port = 8000
+
+# comment above safe
+[profiles.safe]
+model = "safe.gguf"
+ctx_size = 32768
+kv_cache_type_k = "q8_0"
+kv_cache_type_v = "q8_0"
+parallel = 1
+batch_size = 512
+"""
+
+
+class TestBuildProfile:
+    def test_valid_table_builds(self) -> None:
+        p = build_profile(
+            "x",
+            {
+                "model": "m.gguf",
+                "ctx_size": 4096,
+                "kv_cache_type_k": "q8_0",
+                "kv_cache_type_v": "q8_0",
+                "parallel": 1,
+                "batch_size": 512,
+                "spec_type": "draft-mtp",
+            },
+            "default:img",
+        )
+        assert p.model == "m.gguf"
+        assert p.image == "default:img"
+        assert p.spec_type == "draft-mtp"
+
+    def test_missing_required_key_raises(self) -> None:
+        with pytest.raises(ValueError, match="ctx_size"):
+            build_profile(
+                "x",
+                {
+                    "model": "m.gguf",
+                    "kv_cache_type_k": "q8_0",
+                    "kv_cache_type_v": "q8_0",
+                    "parallel": 1,
+                    "batch_size": 512,
+                },
+                "img",
+            )
+
+    def test_unknown_key_raises(self) -> None:
+        with pytest.raises(ValueError, match="bogus"):
+            build_profile(
+                "x",
+                {
+                    "model": "m.gguf",
+                    "ctx_size": 4096,
+                    "kv_cache_type_k": "q8_0",
+                    "kv_cache_type_v": "q8_0",
+                    "parallel": 1,
+                    "batch_size": 512,
+                    "bogus": 1,
+                },
+                "img",
+            )
+
+    def test_non_divisible_ctx_raises_eagerly(self) -> None:
+        # slot_ctx_size is a lazy property; build_profile must trigger it.
+        with pytest.raises(ValueError):
+            build_profile(
+                "x",
+                {
+                    "model": "m.gguf",
+                    "ctx_size": 100,
+                    "kv_cache_type_k": "q8_0",
+                    "kv_cache_type_v": "q8_0",
+                    "parallel": 3,
+                    "batch_size": 512,
+                },
+                "img",
+            )
+
+
+class TestProfilePersistence:
+    def test_format_profile_table_orders_and_types(self) -> None:
+        text = format_profile_table(
+            "mtp",
+            {
+                "model": "m.gguf",
+                "ctx_size": 4096,
+                "kv_cache_type_k": "q8_0",
+                "kv_cache_type_v": "q8_0",
+                "parallel": 1,
+                "batch_size": 512,
+                "cont_batching": True,
+                "spec_type": "draft-mtp",
+                "extra_args": ["--foo", "bar"],
+            },
+        )
+        assert text.startswith("[profiles.mtp]\n")
+        assert 'model = "m.gguf"' in text
+        assert "ctx_size = 4096" in text
+        assert "cont_batching = true" in text
+        assert 'extra_args = ["--foo", "bar"]' in text
+        # canonical order: model before batch_size before tuning.
+        assert text.index("model") < text.index("batch_size") < text.index("spec_type")
+
+    def test_append_preserves_comments_and_roundtrips(self, tmp_path) -> None:
+        f = tmp_path / "p.toml"
+        f.write_text(_SRC_WITH_COMMENTS)
+        append_profile(
+            f, "mtp",
+            {
+                "model": "m.gguf", "ctx_size": 4096, "kv_cache_type_k": "q8_0",
+                "kv_cache_type_v": "q8_0", "parallel": 1, "batch_size": 512,
+                "spec_type": "draft-mtp",
+            },
+        )
+        text = f.read_text()
+        assert "# top comment" in text
+        assert "# comment above safe" in text
+        _, profiles = load_config(f)
+        assert set(profiles) == {"safe", "mtp"}
+        assert profiles["mtp"].spec_type == "draft-mtp"
+
+    def test_append_existing_raises(self, tmp_path) -> None:
+        f = tmp_path / "p.toml"
+        f.write_text(_SRC_WITH_COMMENTS)
+        with pytest.raises(ValueError, match="already"):
+            append_profile(
+                f, "safe",
+                {
+                    "model": "m.gguf", "ctx_size": 4096, "kv_cache_type_k": "q8_0",
+                    "kv_cache_type_v": "q8_0", "parallel": 1, "batch_size": 512,
+                },
+            )
+
+    def test_overwrite_replaces_block_preserving_rest(self, tmp_path) -> None:
+        f = tmp_path / "p.toml"
+        f.write_text(_SRC_WITH_COMMENTS)
+        overwrite_profile(
+            f, "safe",
+            {
+                "model": "safe.gguf", "ctx_size": 16384, "kv_cache_type_k": "f16",
+                "kv_cache_type_v": "f16", "parallel": 1, "batch_size": 1024,
+            },
+        )
+        text = f.read_text()
+        assert "# top comment" in text
+        assert "# comment above safe" in text
+        _, profiles = load_config(f)
+        assert profiles["safe"].ctx_size == 16384
+        assert profiles["safe"].kv_cache_type_k == "f16"
+
+    def test_remove_deletes_block_preserving_rest(self, tmp_path) -> None:
+        f = tmp_path / "p.toml"
+        f.write_text(_SRC_WITH_COMMENTS)
+        remove_profile(f, "safe")
+        text = f.read_text()
+        assert "# top comment" in text
+        assert "[profiles.safe]" not in text
+        _, profiles = load_config(f)
+        assert profiles == {}
+
+    def test_remove_absent_raises(self, tmp_path) -> None:
+        f = tmp_path / "p.toml"
+        f.write_text(_SRC_WITH_COMMENTS)
+        with pytest.raises(ValueError, match="not found"):
+            remove_profile(f, "nope")

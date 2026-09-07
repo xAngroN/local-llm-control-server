@@ -289,21 +289,31 @@ def _default_profiles_path() -> Path:
     return package_root / "config" / "profiles.toml"
 
 
-def load_config(path: Path | None = None) -> tuple[CommonConfig, dict[str, Profile]]:
-    """Load the profile file and return ``(common, profiles)``.
+def resolve_profiles_path(path: Path | None = None) -> Path:
+    """Resolve the active profiles file path.
 
-    The file path is resolved in this order:
+    Resolution order (shared by :func:`load_config` and the profile
+    write helpers so reads and writes always hit the same file):
 
     1. ``path`` if given.
     2. the ``LLAMACTL_PROFILES`` environment variable.
     3. ``config/profiles.toml`` relative to the repository root.
+    """
+    if path is not None:
+        return path
+    env = os.environ.get("LLAMACTL_PROFILES")
+    return Path(env) if env else _default_profiles_path()
+
+
+def load_config(path: Path | None = None) -> tuple[CommonConfig, dict[str, Profile]]:
+    """Load the profile file and return ``(common, profiles)``.
+
+    The file path is resolved by :func:`resolve_profiles_path`.
 
     Unknown keys inside a ``[profiles.<name>]`` table raise
     :class:`ValueError` naming the offending key.
     """
-    if path is None:
-        env = os.environ.get("LLAMACTL_PROFILES")
-        path = Path(env) if env else _default_profiles_path()
+    path = resolve_profiles_path(path)
     with path.open("rb") as fh:
         data = tomllib.load(fh)
     if "common" not in data:
@@ -326,10 +336,27 @@ def _build_common(table: dict) -> CommonConfig:
     )
 
 
+#: Required (non-optional) keys of a ``[profiles.<name>]`` table.
+_REQUIRED_PROFILE_KEYS = (
+    "model",
+    "ctx_size",
+    "kv_cache_type_k",
+    "kv_cache_type_v",
+    "parallel",
+    "batch_size",
+)
+
+
 def _build_profile(name: str, table: dict, default_image: str) -> Profile:
     for key in table:
         if key not in _PROFILE_KEYS:
             raise ValueError(f"unknown key {key!r} in profile {name!r}")
+    missing = [k for k in _REQUIRED_PROFILE_KEYS if k not in table]
+    if missing:
+        raise ValueError(
+            f"profile {name!r} is missing required key(s): "
+            + ", ".join(repr(k) for k in missing)
+        )
     return Profile(
         name=name,
         model=table["model"],
@@ -342,3 +369,148 @@ def _build_profile(name: str, table: dict, default_image: str) -> Profile:
         extra_args=tuple(table.get("extra_args", ())),
         **_read_tuning(table),
     )
+
+
+def build_profile(name: str, table: dict, default_image: str) -> Profile:
+    """Validate a raw profile table and return the :class:`Profile`.
+
+    Public wrapper over :func:`_build_profile` for API-driven creation:
+    rejects unknown/missing keys and bad types (:class:`ValueError`) and
+    *eagerly* checks ``ctx_size`` divisibility by ``parallel`` (which is
+    otherwise only validated lazily via :attr:`Profile.slot_ctx_size`),
+    so an invalid profile is refused before it is ever persisted.
+    """
+    profile = _build_profile(name, table, default_image)
+    profile.slot_ctx_size  # noqa: B018 -- raises ValueError if not divisible
+    return profile
+
+
+# ---------------------------------------------------------------------------
+# Comment-preserving persistence of ``[profiles.<name>]`` tables
+# ---------------------------------------------------------------------------
+
+#: Canonical order in which profile keys are serialized back to TOML.
+_PROFILE_WRITE_ORDER = (
+    "model",
+    "image",
+    "ctx_size",
+    "kv_cache_type_k",
+    "kv_cache_type_v",
+    "parallel",
+    "batch_size",
+    *_TUNING_FIELDS,
+    "extra_args",
+)
+
+
+def _toml_str(value: str) -> str:
+    """Serialize a string as a TOML basic string (double-quoted)."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _toml_value(value: object) -> str:
+    """Serialize a scalar / string-array profile value to TOML text."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return _toml_str(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_str(str(item)) for item in value) + "]"
+    raise ValueError(f"cannot serialize value {value!r} to TOML")
+
+
+def format_profile_table(name: str, table: dict) -> str:
+    """Render a ``[profiles.<name>]`` TOML table from a raw key/value dict.
+
+    Only keys actually present in ``table`` are emitted (so defaults are
+    never written), in the canonical :data:`_PROFILE_WRITE_ORDER`; any
+    remaining keys follow in their original order.
+    """
+    ordered = [k for k in _PROFILE_WRITE_ORDER if k in table]
+    ordered += [k for k in table if k not in _PROFILE_WRITE_ORDER]
+    lines = [f"[profiles.{name}]"]
+    for key in ordered:
+        lines.append(f"{key} = {_toml_value(table[key])}")
+    return "\n".join(lines) + "\n"
+
+
+def _profile_block_span(lines: list[str], name: str) -> tuple[int, int] | None:
+    """Return ``(start, end)`` line indices of a ``[profiles.<name>]`` block.
+
+    The block runs from its header line up to (but excluding) the next
+    top-level ``[...]`` table header or end of file. Returns ``None`` when
+    the table is not present. Comments *above* the header are left with
+    whatever precedes the block; comments *inside* the block belong to it.
+    """
+    header = f"[profiles.{name}]"
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == header:
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        stripped = lines[j].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            end = j
+            break
+    return start, end
+
+
+def append_profile(path: Path, name: str, table: dict) -> None:
+    """Append a new ``[profiles.<name>]`` block, preserving existing text.
+
+    Raises :class:`ValueError` if the table already exists (callers check
+    first, but this is a last-line guard against clobbering a block).
+    """
+    text = path.read_text(encoding="utf-8")
+    if _profile_block_span(text.splitlines(), name) is not None:
+        raise ValueError(f"profile {name!r} already present in {path}")
+    block = format_profile_table(name, table)
+    if text.strip():
+        text = text.rstrip("\n") + "\n\n" + block
+    else:
+        text = block
+    path.write_text(text, encoding="utf-8")
+
+
+def overwrite_profile(path: Path, name: str, table: dict) -> None:
+    """Replace an existing ``[profiles.<name>]`` block in place.
+
+    Preserves everything else in the file, including comments *above* the
+    block; comments *inside* the old block are replaced along with it.
+    Raises :class:`ValueError` when the block is absent.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    span = _profile_block_span(lines, name)
+    if span is None:
+        raise ValueError(f"profile {name!r} not found in {path}")
+    start, end = span
+    block_lines = format_profile_table(name, table).splitlines()
+    lines[start:end] = block_lines
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def remove_profile(path: Path, name: str) -> None:
+    """Delete a ``[profiles.<name>]`` block, preserving everything else.
+
+    Trailing blank lines left behind are collapsed so the file does not
+    accumulate empty gaps. Raises :class:`ValueError` when absent.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    span = _profile_block_span(lines, name)
+    if span is None:
+        raise ValueError(f"profile {name!r} not found in {path}")
+    start, end = span
+    # Also swallow blank lines immediately following the block so removing
+    # a middle table does not leave a double gap.
+    while end < len(lines) and lines[end].strip() == "":
+        end += 1
+    del lines[start:end]
+    text = "\n".join(lines).rstrip("\n")
+    path.write_text(text + "\n" if text else "", encoding="utf-8")

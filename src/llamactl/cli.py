@@ -102,6 +102,51 @@ def _cmd_profiles(args: argparse.Namespace) -> int:
     return _call(args, "GET", "/profiles")
 
 
+def _profile_payload(args: argparse.Namespace) -> dict | None:
+    """Parse the profile fields for create/update from --json or stdin.
+
+    Returns the parsed mapping, or ``None`` (after printing an error) when
+    the input is missing or not a JSON object.
+    """
+    raw = args.fields
+    if raw is None and not sys.stdin.isatty():
+        raw = sys.stdin.read()
+    if not raw:
+        print("llamactl: Profilfelder fehlen (--fields '<obj>' oder via stdin)",
+              file=sys.stderr)
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError as err:
+        print(f"llamactl: ungültiges JSON: {err}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
+        print("llamactl: Profilfelder müssen ein JSON-Objekt sein",
+              file=sys.stderr)
+        return None
+    return data
+
+
+def _cmd_profile_create(args: argparse.Namespace) -> int:
+    payload = _profile_payload(args)
+    if payload is None:
+        return 2
+    payload["name"] = args.name  # path/name wins over any name in the body
+    return _call(args, "POST", "/profiles", payload)
+
+
+def _cmd_profile_update(args: argparse.Namespace) -> int:
+    payload = _profile_payload(args)
+    if payload is None:
+        return 2
+    payload.pop("name", None)
+    return _call(args, "PUT", f"/profiles/{args.name}", payload)
+
+
+def _cmd_profile_delete(args: argparse.Namespace) -> int:
+    return _call(args, "DELETE", f"/profiles/{args.name}")
+
+
 def _cmd_start(args: argparse.Namespace) -> int:
     profile = args.profile or DEFAULT_PROFILE
     return _call(args, "POST", "/start", {"profile": profile})
@@ -228,6 +273,39 @@ def build_parser() -> _Parser:
     )
     profiles.set_defaults(func=_cmd_profiles)
     add_json_flag(profiles)
+
+    def add_fields_flag(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--fields",
+            default=None,
+            help="Profilfelder als JSON-Objekt (sonst von stdin gelesen), "
+            'z. B. \'{"model":"m.gguf","ctx_size":4096,'
+            '"kv_cache_type_k":"q8_0","kv_cache_type_v":"q8_0",'
+            '"parallel":1,"batch_size":512}\'',
+        )
+
+    profile_create = sub.add_parser(
+        "profile-create", help="Neues Profil anlegen (POST /profiles)"
+    )
+    profile_create.add_argument("name", help="Name des neuen Profils")
+    add_fields_flag(profile_create)
+    profile_create.set_defaults(func=_cmd_profile_create)
+    add_json_flag(profile_create)
+
+    profile_update = sub.add_parser(
+        "profile-update", help="Profil ändern (PUT /profiles/<name>)"
+    )
+    profile_update.add_argument("name", help="Name des Profils")
+    add_fields_flag(profile_update)
+    profile_update.set_defaults(func=_cmd_profile_update)
+    add_json_flag(profile_update)
+
+    profile_delete = sub.add_parser(
+        "profile-delete", help="Profil löschen (DELETE /profiles/<name>)"
+    )
+    profile_delete.add_argument("name", help="Name des Profils")
+    profile_delete.set_defaults(func=_cmd_profile_delete)
+    add_json_flag(profile_delete)
 
     start = sub.add_parser(
         "start", help="Starte die Instanz (Default-Profil: 'safe')"
