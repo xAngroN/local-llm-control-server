@@ -3,14 +3,38 @@
 # Zahlenwerte (ctx_size, batch_size, kv_cache_type_k/v, extra_args) vor dem
 # Cutover gegen die Hostkopie des qwen-Skripts verifiziert werden.
 # TODO(port): gegen qwen-Skript verifizieren
+#
+# Tuning-Felder (optional, None = llama.cpp-Default). Sie dürfen im
+# [common]-Block als globaler Default UND pro Profil gesetzt werden; ein
+# Profilwert überschreibt den [common]-Wert. Flag-Zuordnung:
+#   n_gpu_layers      -> -ngl / --n-gpu-layers
+#   flash_attn        -> -fa  / --flash-attn        ("on" | "off" | "auto")
+#   batch_size        -> -b   / --batch-size        (logisches Batch-Limit)
+#   ubatch_size       -> -ub  / --ubatch-size       (physische Micro-Batch)
+#   cont_batching     -> -cb / -nocb                (continuous batching)
+#   spec_type         -> --spec-type                ("draft-mtp" = MTP)
+#   spec_draft_n_max  -> --spec-draft-n-max         (spec-max Tiefe)
+#   spec_draft_n_min  -> --spec-draft-n-min
 
 [common]
 image = "docker.io/ggml-org/llama.cpp:server-vulkan"
 models_dir = "/var/home/bazzite/models"
 container_name = "llamactl-model"
 host_port = 8080
+# Globale GPU-/Batching-Defaults (früher als rohe extra_args gepflegt).
+n_gpu_layers = 999
+flash_attn = "on"
+cont_batching = true
+# HINWEIS: Die früheren extra_args `--draft-max 4 --draft 0` sind in der
+# aktuellen llama.cpp entfernt (harter Startfehler). Speculative Decoding
+# ist jetzt über spec_type / spec_draft_n_max konfigurierbar und bleibt
+# hier per Default AUS. Beispiel für MTP-Self-Speculation (Modell muss
+# MTP-Layer besitzen, z. B. Qwen3-A3B):
+#   spec_type = "draft-mtp"
+#   spec_draft_n_max = 4
+#   spec_draft_n_min = 0
 # --metrics: der API-Server wertet die Prometheus-Zähler des Modell-Servers aus
-extra_args = ["-ngl", "999", "-fa", "on", "--jinja", "--draft-max", "4", "--draft", "0", "--metrics"]
+extra_args = ["--jinja", "--metrics"]
 
 [profiles.fast]
 model = "fast.gguf"
@@ -19,6 +43,7 @@ kv_cache_type_k = "f16"
 kv_cache_type_v = "f16"
 parallel = 1
 batch_size = 2048
+ubatch_size = 512
 
 [profiles.large]
 model = "large.gguf"
@@ -27,6 +52,7 @@ kv_cache_type_k = "q8_0"
 kv_cache_type_v = "q8_0"
 parallel = 1
 batch_size = 1024
+ubatch_size = 512
 
 [profiles.safe]
 model = "safe.gguf"
@@ -35,6 +61,7 @@ kv_cache_type_k = "q8_0"
 kv_cache_type_v = "q8_0"
 parallel = 1
 batch_size = 512
+ubatch_size = 512
 
 # `shared` teilt das bereits gemessene 32768-Token-Budget auf 4 Slots zu je
 # 8192 Token auf, statt ein neues, unvermessenes Speicherbudget aufzumachen;
@@ -46,3 +73,4 @@ kv_cache_type_k = "q8_0"
 kv_cache_type_v = "q8_0"
 parallel = 4
 batch_size = 512
+ubatch_size = 512

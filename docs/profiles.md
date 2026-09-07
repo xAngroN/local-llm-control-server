@@ -21,3 +21,56 @@ Profile liegen zwischen 18,17 und 18,99 GiB.
   KV-Cache-Gesamtgröße gleich bleibt. Das `shared`-Profil teilt zwar das bekannte
   Kontextbudget auf 4 Slots (je 8192 Tokens), der daraus resultierende
   VRAM-Zuschlag ist aber erst durch eine Messung belegt.
+
+## Tuning-Felder
+
+Neben den Sizing-Feldern kennt jedes Profil optionale Tuning-Knöpfe. Sie dürfen
+im `[common]`-Block (globaler Default) **und** pro Profil gesetzt werden; ein
+Profilwert überschreibt den `[common]`-Wert. Ist ein Feld weder im Profil noch
+in `[common]` gesetzt, wird das zugehörige Flag gar nicht gerendert und
+llama.cpp verwendet seinen eigenen Default.
+
+| TOML-Feld          | llama.cpp-Flag        | Typ            | Bedeutung                                   |
+|--------------------|-----------------------|----------------|---------------------------------------------|
+| `batch_size`       | `-b` / `--batch-size` | int (Pflicht)  | logisches Batch-Limit (Default 2048)        |
+| `ubatch_size`      | `-ub` / `--ubatch-size` | int          | physische Micro-Batch (Default 512)         |
+| `n_gpu_layers`     | `-ngl` / `--n-gpu-layers` | int        | Layer im VRAM (`999` = alle)                |
+| `flash_attn`       | `-fa` / `--flash-attn` | `on`/`off`/`auto` | Flash Attention                          |
+| `cont_batching`    | `-cb` / `-nocb`       | bool           | Continuous (dynamic) Batching               |
+| `spec_type`        | `--spec-type`         | str            | Speculative-Decoding-Typ, `draft-mtp` = MTP |
+| `spec_draft_n_max` | `--spec-draft-n-max`  | int            | spec-max Tiefe (Draft-Tokens, Default 3)    |
+| `spec_draft_n_min` | `--spec-draft-n-min`  | int            | minimale Draft-Tokens                       |
+
+`-b` (logisches Batch) und `-ub` (physisches Micro-Batch) sind **zwei getrennte
+Felder** — `batch_size` ist nicht `-ub`.
+
+**MTP (Multi-Token-Prediction):** In der aktuellen llama.cpp ist MTP der
+Speculative-Decoding-Typ `draft-mtp` mit Self-Speculation (kein separates
+Draft-Modell). Das Modell muss MTP-Layer besitzen (z. B. Qwen3-A3B). Beispiel:
+
+```toml
+[profiles.qwen-mtp]
+model = "qwen3-a3b.gguf"
+ctx_size = 32768
+kv_cache_type_k = "q8_0"
+kv_cache_type_v = "q8_0"
+parallel = 1
+batch_size = 512
+spec_type = "draft-mtp"
+spec_draft_n_max = 4     # spec-max Tiefe
+spec_draft_n_min = 0
+```
+
+> Historie: Die früher in `extra_args` gepflegten `--draft-max` / `--draft`
+> sind in der aktuellen llama.cpp **entfernt** und führen zu einem harten
+> Startfehler. Sie wurden durch `spec_draft_n_max` / `spec_draft_n_min` ersetzt.
+
+## Auslesen der effektiven Konfiguration
+
+Die effektiven (Profil über `[common]` gemergten) Werte sind über die API
+auslesbar:
+
+- `GET /profiles` — alle Profile mit Sizing- und Tuning-Feldern.
+- `GET /profiles/{name}` — ein einzelnes Profil (404 bei unbekanntem Namen).
+
+Auf der Kommandozeile liefert `llamactl profiles --json` denselben Inhalt.

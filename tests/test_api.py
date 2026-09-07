@@ -52,6 +52,40 @@ def test_profiles_lists_all_four_with_ctx_and_slot_ctx(fake_podman) -> None:
         assert entry["ctx_size"] == entry["parallel"] * entry["slot_ctx_size"]
 
 
+def test_profiles_expose_effective_tuning(fake_podman) -> None:
+    client = make_client(fake_podman)
+    body = client.get("/profiles").json()
+    entry = body["fast"]
+    # per-profile value
+    assert entry["batch_size"] == 2048
+    assert entry["ubatch_size"] == 512
+    # inherited from [common]
+    assert entry["n_gpu_layers"] == 999
+    assert entry["flash_attn"] == "on"
+    assert entry["cont_batching"] is True
+    # speculative decoding off by default in the bundled config
+    assert entry["spec_type"] is None
+    assert entry["spec_draft_n_max"] is None
+
+
+def test_profile_detail_endpoint_returns_effective_config(fake_podman) -> None:
+    client = make_client(fake_podman)
+    response = client.get("/profiles/shared")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ctx_size"] == 32768
+    assert body["slot_ctx_size"] == 8192
+    assert body["n_gpu_layers"] == 999
+    assert body["flash_attn"] == "on"
+
+
+def test_profile_detail_unknown_returns_404(fake_podman) -> None:
+    client = make_client(fake_podman)
+    response = client.get("/profiles/nope")
+    assert response.status_code == 404
+    assert "nope" in response.json()["detail"]
+
+
 def test_start_valid_profile_returns_state_and_runs_container(fake_podman) -> None:
     client = make_client(fake_podman)
     response = client.post("/start", json={"profile": "fast"})

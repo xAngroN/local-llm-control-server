@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import Body, FastAPI, HTTPException
 
 from llamactl import __version__
-from llamactl.config import load_config
+from llamactl.config import load_config, resolve_tuning
 from llamactl.events import ContainerEventWatcher
 from llamactl.health import HealthPoller
 from llamactl.lifecycle import (
@@ -29,17 +29,39 @@ from llamactl.suspend_watch import PowerStateWatcher
 logger = logging.getLogger(__name__)
 
 
+def _profile_detail(manager: LifecycleManager, name: str) -> dict:
+    """Build the read-back body for a single profile.
+
+    Reports the sizing fields plus the *effective* tuning configuration
+    (:func:`resolve_tuning`) -- i.e. the per-profile value merged over the
+    ``[common]`` default -- so callers can read exactly which llama.cpp
+    knobs (``-b``/``-ub``, flash attention, ngl, continuous batching and
+    the MTP/speculative-decoding settings) the profile will run with.
+    """
+    profile = manager._profiles[name]
+    tuning = resolve_tuning(profile, manager._common)
+    return {
+        "model": profile.model,
+        "ctx_size": profile.ctx_size,
+        "parallel": profile.parallel,
+        "slot_ctx_size": profile.slot_ctx_size,
+        "batch_size": profile.batch_size,
+        "ubatch_size": tuning["ubatch_size"],
+        "n_gpu_layers": tuning["n_gpu_layers"],
+        "flash_attn": tuning["flash_attn"],
+        "cont_batching": tuning["cont_batching"],
+        "spec_type": tuning["spec_type"],
+        "spec_draft_n_max": tuning["spec_draft_n_max"],
+        "spec_draft_n_min": tuning["spec_draft_n_min"],
+    }
+
+
 def _profiles_response(manager: LifecycleManager) -> dict:
-    """Build the /profiles body: name -> ctx_size / parallel / slot ctx."""
-    result: dict = {}
-    for name in manager.list_profiles():
-        profile = manager._profiles[name]
-        result[name] = {
-            "ctx_size": profile.ctx_size,
-            "parallel": profile.parallel,
-            "slot_ctx_size": profile.slot_ctx_size,
-        }
-    return result
+    """Build the /profiles body: name -> full effective profile detail."""
+    return {
+        name: _profile_detail(manager, name)
+        for name in manager.list_profiles()
+    }
 
 
 def create_app(manager: LifecycleManager | None = None) -> FastAPI:
@@ -108,8 +130,15 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
 
     @app.get("/profiles")
     def profiles() -> dict:
-        """List all configured profiles with ctx_size, parallel, slot ctx."""
+        """List all profiles with their effective sizing + tuning config."""
         return _profiles_response(manager)
+
+    @app.get("/profiles/{name}")
+    def profile_detail(name: str) -> dict:
+        """Return one profile's effective sizing + tuning configuration."""
+        if name not in manager.list_profiles():
+            raise HTTPException(404, detail=f"unknown profile {name!r}")
+        return _profile_detail(manager, name)
 
     @app.post("/start")
     def start(payload: dict = Body(...)) -> dict:

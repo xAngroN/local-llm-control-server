@@ -203,7 +203,9 @@ def build_parser() -> _Parser:
     serve.set_defaults(func=_cmd_serve)
 
     profiles = sub.add_parser(
-        "profiles", help="Liste der Profile (ctx_size, parallel, Slot-Kontext)"
+        "profiles",
+        help="Liste der Profile (Sizing + effektives Tuning: -b/-ub, "
+        "-ngl, -fa, cont-batching, MTP/spec)",
     )
     profiles.set_defaults(func=_cmd_profiles)
     add_json_flag(profiles)

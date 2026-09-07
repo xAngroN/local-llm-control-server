@@ -10,6 +10,7 @@ from llamactl.config import (
     load_config,
     render_podman_args,
     render_server_args,
+    resolve_tuning,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -172,10 +173,16 @@ class TestLoadConfig:
         assert common.models_dir == "/var/home/bazzite/models"
         assert common.container_name == "llamactl-model"
         assert common.host_port == 8080
+        # -ngl / -fa are now typed tuning fields, not raw extra_args.
+        assert common.n_gpu_layers == 999
+        assert common.flash_attn == "on"
+        assert common.cont_batching is True
         extra = tuple(common.extra_args)
-        for value in ("-ngl", "999", "-fa", "on", "--jinja"):
-            assert value in extra
-        assert extra[:5] == ("-ngl", "999", "-fa", "on", "--jinja")
+        assert extra == ("--jinja", "--metrics")
+        # The removed --draft-max / --draft flags (hard start error in the
+        # current llama.cpp) must not linger anywhere in the config.
+        assert "--draft-max" not in extra
+        assert "--draft" not in extra
 
     def test_shared_splits_ctx_across_slots(self) -> None:
         _, profiles = load_config(BUNDLED_PROFILES)
@@ -201,7 +208,9 @@ class TestLoadConfig:
             assert profile.image in args
             # common extra flags are applied for every profile
             assert "--jinja" in args
-            assert "-ngl" in args and args[args.index("-ngl") + 1] == "999"
+            # -ngl is rendered from the typed common tuning field now.
+            assert "--n-gpu-layers" in args
+            assert args[args.index("--n-gpu-layers") + 1] == "999"
 
     def test_all_profiles_render_with_metrics_flag(self) -> None:
         common, profiles = load_config(BUNDLED_PROFILES)
@@ -239,4 +248,117 @@ class TestLoadConfig:
             "bogus_key = 1\n"
         )
         with pytest.raises(ValueError, match="bogus_key"):
+            load_config(file)
+
+
+class TestTuning:
+    """Optional tuning knobs: -ub, -ngl, -fa, -cb, MTP/spec-decoding."""
+
+    def test_unset_tuning_emits_nothing(self) -> None:
+        # A profile and common with no tuning fields must render exactly as
+        # before -- no stray flags leak in.
+        args = render_server_args(_profile(), _common())
+        for flag in (
+            "--ubatch-size",
+            "--n-gpu-layers",
+            "--flash-attn",
+            "--cont-batching",
+            "--no-cont-batching",
+            "--spec-type",
+            "--spec-draft-n-max",
+            "--spec-draft-n-min",
+        ):
+            assert flag not in args, flag
+
+    def test_all_tuning_fields_render_expected_flags(self) -> None:
+        profile = _profile(
+            ubatch_size=256,
+            n_gpu_layers=999,
+            flash_attn="on",
+            cont_batching=True,
+            spec_type="draft-mtp",
+            spec_draft_n_max=4,
+            spec_draft_n_min=0,
+        )
+        args = render_server_args(profile, _common())
+
+        def pair(flag: str) -> str:
+            return args[args.index(flag) + 1]
+
+        assert pair("--ubatch-size") == "256"
+        assert pair("--n-gpu-layers") == "999"
+        assert pair("--flash-attn") == "on"
+        assert "--cont-batching" in args
+        assert pair("--spec-type") == "draft-mtp"
+        assert pair("--spec-draft-n-max") == "4"
+        assert pair("--spec-draft-n-min") == "0"
+
+    def test_cont_batching_false_renders_disable_flag(self) -> None:
+        args = render_server_args(_profile(cont_batching=False), _common())
+        assert "--no-cont-batching" in args
+        assert "--cont-batching" not in args
+
+    def test_profile_overrides_common_tuning(self) -> None:
+        common = _common(n_gpu_layers=999, flash_attn="on", ubatch_size=512)
+        profile = _profile(n_gpu_layers=0, ubatch_size=None)
+        resolved = resolve_tuning(profile, common)
+        # Profile value wins when set...
+        assert resolved["n_gpu_layers"] == 0
+        # ...common value is inherited when the profile leaves it None...
+        assert resolved["ubatch_size"] == 512
+        assert resolved["flash_attn"] == "on"
+        # ...and unset-at-both-levels stays None.
+        assert resolved["spec_type"] is None
+
+    def test_zero_is_not_treated_as_unset(self) -> None:
+        # 0 is a meaningful value (e.g. n-gpu-layers=0) and must still be
+        # emitted, not swallowed by the None-inheritance logic.
+        args = render_server_args(_profile(n_gpu_layers=0), _common(n_gpu_layers=999))
+        assert args[args.index("--n-gpu-layers") + 1] == "0"
+
+    def test_tuning_from_toml(self, tmp_path) -> None:
+        file = tmp_path / "profiles.toml"
+        file.write_text(
+            "[common]\n"
+            "image = \"img\"\n"
+            "models_dir = \"/m\"\n"
+            "container_name = \"c\"\n"
+            "host_port = 8080\n"
+            "n_gpu_layers = 999\n"
+            "flash_attn = \"on\"\n"
+            "cont_batching = true\n"
+            "[profiles.mtp]\n"
+            "model = \"m.gguf\"\n"
+            "ctx_size = 1024\n"
+            "kv_cache_type_k = \"f16\"\n"
+            "kv_cache_type_v = \"f16\"\n"
+            "parallel = 1\n"
+            "batch_size = 128\n"
+            "ubatch_size = 256\n"
+            "spec_type = \"draft-mtp\"\n"
+            "spec_draft_n_max = 4\n"
+        )
+        common, profiles = load_config(file)
+        assert common.n_gpu_layers == 999
+        assert common.cont_batching is True
+        p = profiles["mtp"]
+        assert p.ubatch_size == 256
+        assert p.spec_type == "draft-mtp"
+        assert p.spec_draft_n_max == 4
+        # common tuning is inherited where the profile is silent
+        resolved = resolve_tuning(p, common)
+        assert resolved["n_gpu_layers"] == 999
+        assert resolved["flash_attn"] == "on"
+
+    def test_invalid_flash_attn_raises(self, tmp_path) -> None:
+        file = tmp_path / "profiles.toml"
+        file.write_text(
+            "[common]\n"
+            "image = \"img\"\n"
+            "models_dir = \"/m\"\n"
+            "container_name = \"c\"\n"
+            "host_port = 8080\n"
+            "flash_attn = \"yes\"\n"
+        )
+        with pytest.raises(ValueError, match="flash_attn"):
             load_config(file)
