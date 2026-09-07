@@ -169,6 +169,8 @@ def test_status_idle_reports_stopped_with_expected_fields(fake_podman) -> None:
     body = response.json()
     assert body["state"] == "stopped"
     assert body["profile"] is None
+    # No profile running -> no model.
+    assert body["model"] is None
     assert body["since"]
 
 
@@ -180,8 +182,20 @@ def test_status_after_start_reports_active_state_and_profile(fake_podman) -> Non
     body = response.json()
     assert body["state"] == "loading"
     assert body["profile"] == "fast"
+    # The active profile's model file is surfaced next to the profile name.
+    assert body["model"] == "fast.gguf"
     assert body["container_id"] is not None
     assert body["since"]
+
+
+def test_start_and_reload_responses_include_model(fake_podman) -> None:
+    client = make_client(fake_podman)
+    started = client.post("/start", json={"profile": "fast"}).json()
+    assert started["profile"] == "fast"
+    assert started["model"] == "fast.gguf"
+    reloaded = client.post("/reload", json={"profile": "large"}).json()
+    assert reloaded["profile"] == "large"
+    assert reloaded["model"] == "large.gguf"
 
 
 def test_status_reports_every_state_as_lowercase_string(fake_podman) -> None:

@@ -65,6 +65,29 @@ def _profiles_response(manager: LifecycleManager) -> dict:
     }
 
 
+def _status_body(manager: LifecycleManager) -> dict:
+    """Tracker status enriched with the active profile's model file.
+
+    The :class:`InstanceTracker` is deliberately config-agnostic: it only
+    knows the profile *name*. Every runtime-state response (``/status``,
+    ``/start``, ``/stop``, ``/reload``, ``/suspend``) should also report
+    *which model* the active profile runs, so the model file is resolved
+    here from the manager's profiles and inserted right after ``profile``.
+    It is ``None`` when nothing is running (profile ``None``) or the active
+    profile is no longer in the config.
+    """
+    body = manager._tracker.to_dict()
+    profile_name = body.get("profile")
+    profile = manager._profiles.get(profile_name) if profile_name else None
+    model = profile.model if profile is not None else None
+    result: dict = {}
+    for key, value in body.items():
+        result[key] = value
+        if key == "profile":
+            result["model"] = model
+    return result
+
+
 def create_app(manager: LifecycleManager | None = None) -> FastAPI:
     """Build the FastAPI application for a given lifecycle manager.
 
@@ -155,7 +178,7 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             raise HTTPException(409, detail=str(err)) from err
         except PodmanError as err:
             raise HTTPException(500, detail=err.stderr) from err
-        return tracker.to_dict()
+        return _status_body(manager)
 
     @app.post("/stop")
     def stop() -> dict:
@@ -164,12 +187,16 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             manager.stop()
         except PodmanError as err:
             raise HTTPException(500, detail=err.stderr) from err
-        return tracker.to_dict()
+        return _status_body(manager)
 
     @app.get("/status")
     def status() -> dict:
-        """Return the current instance state (read-only, no podman calls)."""
-        return tracker.to_dict()
+        """Return the current instance state (read-only, no podman calls).
+
+        Includes the active profile's ``model`` file alongside the profile
+        name (see :func:`_status_body`).
+        """
+        return _status_body(manager)
 
     @app.get("/metrics")
     def metrics() -> dict:
@@ -197,7 +224,7 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             suspend()
         except PowerError as err:
             raise HTTPException(500, detail=str(err)) from err
-        result = tracker.to_dict()
+        result = _status_body(manager)
         result["suspend_requested"] = True
         return result
 
@@ -215,6 +242,6 @@ def create_app(manager: LifecycleManager | None = None) -> FastAPI:
             raise HTTPException(409, detail=str(err)) from err
         except PodmanError as err:
             raise HTTPException(500, detail=err.stderr) from err
-        return tracker.to_dict()
+        return _status_body(manager)
 
     return app
